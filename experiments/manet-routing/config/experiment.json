@@ -1,0 +1,50 @@
+{
+  "experiment": {
+    "name": "manet-routing-comparison",
+    "description": "Comparação de AODV, DSDV e OLSR em Wi-Fi ad hoc com mobilidade e tráfego UDP Echo.",
+    "version": "1.0.0",
+    "ns3_version": "3.39",
+    "seed": 12345,
+    "protocols": [
+      "aodv",
+      "dsdv",
+      "olsr"
+    ],
+    "output_format": "flowmonitor-xml"
+  },
+  "scenario": {
+    "nodes": 30,
+    "simulation_time_seconds": 100.0,
+    "max_speed_mps": 2.0,
+    "initial_pause_seconds": 1.0,
+    "field_width_meters": 100.0,
+    "field_height_meters": 50.0,
+    "wifi_standard": "80211b",
+    "phy_mode": "DsssRate11Mbps",
+    "channel_type": "YansWifiChannel",
+    "mac_type": "AdhocWifiMac",
+    "ip_base": "10.0.0.0",
+    "ip_mask": "255.0.0.0",
+    "client_node": 0,
+    "server_node": 1,
+    "traffic": {
+      "protocol": "udp",
+      "port": 9,
+      "start_seconds": 10.0,
+      "packet_size_bytes": 512,
+      "max_packets": 1000,
+      "interval_seconds": 1.0
+    },
+    "routing": {
+      "aodv": {
+        "module": "aodv"
+      },
+      "dsdv": {
+        "module": "dsdv"
+      },
+      "olsr": {
+        "module": "olsr"
+      }
+    }
+  }
+}

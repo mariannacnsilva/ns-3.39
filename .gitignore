@@ -1,0 +1,22 @@
+# Build artifacts
+build/
+cmake-cache/
+**/*.o
+**/*.so
+**/*.a
+**/*.dylib
+**/*.exe
+
+# Generated simulation outputs
+*.pcap
+*.tr
+*.csv
+*.xml
+experiments/manet-routing/results/raw/**
+experiments/manet-routing/results/processed/**
+
+# Runtime and editor files
+.vscode/
+__pycache__/
+*.py[cod]
+.DS_Store
