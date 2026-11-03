@@ -1,6 +1,8 @@
 # Build artifacts
 build/
 cmake-cache/
+**/CMakeFiles/
+**/CMakeCache.txt
 **/*.o
 **/*.so
 **/*.a
@@ -10,13 +12,16 @@ cmake-cache/
 # Generated simulation outputs
 *.pcap
 *.tr
-*.csv
-*.xml
-experiments/manet-routing/results/raw/**
-experiments/manet-routing/results/processed/**
+results/
+venv/
+.venv/
+**/venv/
+**/.venv/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+**/animation/
 
 # Runtime and editor files
 .vscode/
-__pycache__/
-*.py[cod]
 .DS_Store
