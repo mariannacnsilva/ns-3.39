@@ -1,28 +1,90 @@
-# Redes Móveis 2026/2 — comparação de AODV, OLSR e DSDV
+# Comparação de roteamento MANET com ns-3.39
 
 ## Objetivo
 
-Comparar, sob condições reproduzíveis de mobilidade, como AODV, OLSR e DSDV se comportam em **PDR, throughput, atraso e jitter**. A Etapa 2 acrescenta uma única variável experimental — taxa de tráfego por fluxo — e avalia também o overhead de controle. Métricas são analisadas separadamente; não há nota única nem declaração de vencedor além do que os dados sustentam. Toda interpretação é **limitada às condições simuladas**.
+Investigar a hipótese **H1**: aumentar a velocidade de mobilidade pode piorar atraso, jitter, vazão e/ou PDR em uma MANET. O estudo compara os resultados de AODV, DSDV e OLSR sem declarar um protocolo vencedor. As conclusões são limitadas ao cenário e aos parâmetros descritos aqui.
 
-## Versão do ns-3 e revisão
+## Guia rápido: o que o experimento faz
 
-- ns-3: **3.39** (arquivo `VERSION`).
-- Revisão exata: obtida por leitura de `git rev-parse HEAD` e `git describe --always --dirty` e gravada no manifesto raiz e nos manifestos de execução. O repositório ns-3 também é o repositório do projeto neste checkout; ambos os campos indicam a mesma revisão. Não fixe um hash neste README, pois os resultados devem registrar a revisão do checkout que os produziu.
-Commit da versão do artigo: <preencher após o commit final>
+Uma MANET é uma rede sem ponto de acesso central: os nós móveis enviam dados e podem encaminhar pacotes uns dos outros. O ns-3 simula os nós, o rádio, o movimento e o roteamento. O experimento envia quatro fluxos UDP entre pares fixos e mede os pacotes observados no destino.
 
-## Sistema operacional, compilador e dependências
+- **AODV** descobre rotas sob demanda; **DSDV** e **OLSR** mantêm informações de rota proativamente.
+- **PDR** é a porcentagem de pacotes transmitidos que chegaram ao destino.
+- **Vazão** é o número de bits recebidos dividido pela janela útil da aplicação.
+- **Atraso** é o tempo médio entre envio e recepção dos pacotes entregues.
+- **Jitter** é a variação média do atraso entre recepções consecutivas.
 
-Suporte documentado para Ubuntu 22.04/24.04 (nativo ou WSL2 no Windows 10/11), Python 3.10+ e toolchain C++17: g++, CMake, Ninja/Make e ferramentas necessárias ao ns-3.39. No Windows, execute build/simulações no Ubuntu do WSL; PowerShell serve para testes Python se as dependências estiverem instaladas, mas a compilação nativa no Windows não está validada. Para abrir animações, instale Qt 5 e o visualizador NetAnim compatível com ns-3.39.
+## Cenário experimental
 
-### Clonar e preparar ambiente
+Os parâmetros executáveis ficam em `config/experiment.json`. Os manifestos preservam a configuração e a revisão usadas.
 
-No terminal Ubuntu/WSL:
+| Parâmetro | Etapa 1 — base | Etapa 2 — carga |
+|---|---|---|
+| Nós e área | 20 nós em 500 × 500 m | Igual à Etapa 1 |
+| Rádio | IEEE 802.11g ad hoc, 2,4 GHz, canal 1, largura 20 MHz, taxa PHY fixa de 6 Mbps | Igual à Etapa 1 |
+| Propagação | YANS com LogDistance; expoente 3, perda de referência 40,05 dB a 1 m | Igual à Etapa 1 |
+| Mobilidade | RandomWaypoint; velocidade mínima 1 m/s, pausa 10 s; velocidade máxima 1, 5, 10 e 20 m/s | Igual à Etapa 1 |
+| Aplicação | 4 fluxos UDP: 0→1, 2→3, 4→5 e 6→7; payload de 512 bytes | Mesmos fluxos e payload |
+| Taxa | 10 pacotes/s por fluxo | 10 e 100 pacotes/s por fluxo |
+| Duração | 120 s; tráfego entre 10 e 110 s; janela útil de 100 s e 10 s de escoamento | Igual à Etapa 1 |
+| Runs | Runs 1–10 | Runs 1–30 |
+| Execuções | 3 protocolos × 4 velocidades × 10 runs = **120** | 3 protocolos × 4 velocidades × 2 cargas × 30 runs = **720** |
+
+A Etapa 2 altera apenas a carga oferecida. Em ambas, a posição inicial usa stream 10, a mobilidade usa streams atribuídos a partir de 1000, a seed mestre é 12345 e o run é passado a `RngSeedManager::SetRun`. Para uma mesma velocidade/run, os protocolos e cargas devem ter trajetórias iguais, conferidas pelo SHA-256 do trace. As runs 1–10 da Etapa 2 a 10 pacotes/s também são comparadas com a Etapa 1 para confirmar reprodução exata dos dados por fluxo.
+
+### Métricas
+
+As métricas são calculadas por fluxo e agregadas por execução, somando pacotes e bytes:
+
+- **Vazão (Mbps)** = `8 × rxBytes / (100 × 10⁶)`. `rxBytes` do FlowMonitor inclui cabeçalhos IP e UDP.
+- **PDR (%)** = `100 × rxPackets / txPackets`.
+- **Atraso médio (ms)** = `delaySum / rxPackets`; ausente se não houver recepção.
+- **Jitter médio (ms)** = `jitterSum / (rxPackets − 1)`; ausente se houver menos de duas recepções.
+
+Na agregação de uma execução, atraso é ponderado pelo total de pacotes recebidos; jitter, pelo total de pares consecutivos recebidos em cada fluxo. A vazão usa a janela fixa de 100 s, não o tempo entre o primeiro e o último pacote recebido. O analisador informa média, desvio-padrão, IC t de 95% e quantidade válida por célula.
+
+### Decisão de H1
+
+Para cada protocolo, métrica e carga, compara-se o IC de 95% a 1 m/s com o IC a 20 m/s:
+
+- **Sustentada:** os ICs não se sobrepõem no sentido de piora — atraso/jitter aumentam, ou vazão/PDR diminuem.
+- **Melhora:** os ICs não se sobrepõem na direção oposta.
+- **Inconclusiva:** os ICs se sobrepõem ou não há amostra válida para calcular os intervalos.
+
+Não são feitos testes estatísticos entre protocolos. As quatro figuras de cada etapa apresentam uma série por protocolo (e, na Etapa 2, por carga), com barras de IC de 95%.
+
+### Checagem de carga a 100 pacotes/s
+
+A carga oferecida por quatro fluxos é 1,6384 Mbps de payload. Considerando cabeçalhos IPv4/UDP, são aproximadamente 1,728 Mbps na camada IP, frente à taxa PHY configurada de 6 Mbps. Essa razão não mede airtime: preâmbulos, contenção, retransmissões e tráfego de roteamento também consomem o canal. O relatório da Etapa 2 registra a comparação descritiva de PDR e atraso entre 10 e 100 pacotes/s como checagem de indícios de contenção, sem afirmar saturação só com base na taxa nominal.
+
+## Preparação do ambiente
+
+O build e as simulações devem ser executados em Ubuntu 22.04/24.04, nativo ou via WSL2 no Windows. Requisitos: g++, CMake, Ninja ou Make, Python 3 e dependências do `requirements.txt`. Qt 5 é necessário apenas para compilar/abrir o visualizador NetAnim.
+
+### Hardware e software do ambiente inventariado
+
+Inventário da máquina disponível para este projeto em 4 de novembro de 2026. **O build do ns-3 e os pilotos ainda não foram concluídos com sucesso**, portanto estes dados descrevem o ambiente configurado, não uma execução experimental validada. Atualize esta seção caso os experimentos sejam executados em outra máquina ou com versões diferentes.
+
+| Componente | Especificação |
+|---|---|
+| Computador | Acer Nitro ANV15-51 |
+| Processador | 13th Gen Intel Core i7-13620H; 10 núcleos, 16 processadores lógicos |
+| Memória | 15,7 GB RAM (aprox. 16 GB) |
+| Sistema host | Windows 10 Home 25H2, build 26200 |
+| Ambiente de build | WSL 2, Ubuntu 24.04.1 LTS (Noble Numbat) |
+| ns-3 | 3.39 (versão do código-fonte em `VERSION`; build ainda pendente) |
+| Python | 3.12.3 no WSL; ambiente virtual `.venv` |
+| Compilador C++ | g++ 13.3.0 |
+| CMake | 3.28.3 |
+| Ninja | 1.11.1 |
+| Dependências Python observadas | NumPy 2.5.4, pandas 3.1.0, SciPy 1.18.1 e Matplotlib 3.11.2 |
+
+Qt 5 e NetAnim são opcionais e não foram considerados necessários para executar as métricas; servem somente para compilar/visualizar as animações.
 
 ```bash
 sudo apt update
 sudo apt install -y git g++ cmake ninja-build python3 python3-venv python3-pip pkg-config
-# Qt é opcional para simular e necessário para abrir as animações com NetAnim.
-sudo apt install -y qtbase5-dev qt5-qmake
+sudo apt install -y qtbase5-dev qt5-qmake  # opcional: NetAnim
 
 git clone https://github.com/mariannacnsilva/ns-3.39.git
 cd ns-3.39
@@ -30,201 +92,63 @@ python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
-```
-
-### Configurar e compilar
-
-Na raiz do repositório, com o ambiente virtual ativado:
-
-```bash
 ./ns3 configure --enable-examples
 ./ns3 build scratch_manet-routing-compare
+python -m unittest tests.test_experiment -v
 ```
 
-A animação no simulador usa `AnimationInterface`, incluída no ns-3. Para compilar o aplicativo NetAnim separado, configure CMake com `-DNS3_NETANIM=ON` e compile conforme a versão Qt disponível:
+## Execução
+
+Todos os comandos abaixo partem da raiz do repositório. `--dry-run` apenas lista a matriz: não executa nem compila o ns-3.
+
+### Conferir matrizes
 
 ```bash
-cmake -S . -B cmake-cache -DNS3_NETANIM=ON
-cmake --build cmake-cache
+python scripts/run_experiment.py --stage stage1 --dry-run  # 120 execuções
+python scripts/run_experiment.py --stage stage2 --dry-run  # 720 execuções
+python scripts/run_experiment.py --stage stage1 --animation --dry-run  # 12 animações
 ```
 
-## Etapas e parâmetros
-
-Todos os parâmetros variáveis ficam em `config/experiment.json`. Os manifestos salvam uma cópia e seu hash. A Etapa 2 herda o cenário-base e altera **somente a taxa UDP por fluxo**; o overhead é uma métrica adicional, não uma variável do cenário.
-
-| Etapa | Nós e área | Wi-Fi fixo | Mobilidade | Fluxos UDP | Velocidade máxima | Taxas/run | Duração total / útil | Runs | Execuções completas |
-|---|---|---|---|---|---|---|---|---:|---:|
-| 1 — Base | 20; 500 × 500 m | 802.11g, canal 1/2,4 GHz, 20 MHz, modo fixo 6 Mbps | RandomWaypoint; posição uniforme; pausa 10 s; mínima 1 m/s | 4 pares fixos: 0→1, 2→3, 4→5, 6→7; UDP 512 B | 1, 5, 10, 20 m/s | 10 pps/fluxo | 120 s / 100 s; tráfego 10–110 s e 10 s de drenagem | 10 | 3 × 4 × 10 = **120** |
-| 2 — Extensão de carga | Herda Etapa 1 | Idêntico à Etapa 1 | Idêntico à Etapa 1 | Os mesmos 4 fluxos | 1, 5, 10, 20 m/s | 10 e 100 pps/fluxo | Idêntico à Etapa 1 | 10 | 3 × 4 × 2 × 10 = **240** |
-| 3 — Complementar | 10; 100 × 50 m | 802.11p, canal 172/5,86 GHz, 10 MHz, 3 Mbps fixos | RandomWaypoint; uniforme; pausa 10 s; mínima 1 m/s | 1 fluxo 0→1; UDP 512 B | 1, 2, 10, 20 m/s | 10 e 100 pps | 180 s / 160 s; tráfego 10–170 s | 30 | 3 × 4 × 2 × 30 = **720** |
-
-A Etapa 1 usa 802.11g em 2,4 GHz com 6 Mbps fixos, em vez de 802.11p: é um padrão comum de WLAN ad hoc, com canal de 20 MHz, apropriado para comparar protocolos de roteamento em uma MANET genérica. A Etapa 2 mantém exatamente esse padrão e modo para isolar a carga como variável adicional. Os parâmetros de roteamento AODV/OLSR/DSDV permanecem padrão. Modelos de propagação e valores fixos adicionais estão descritos no JSON.
-
-| Parâmetro | Significado e unidade | Padrão / valor |
-|---|---|---:|
-| `seed_master` | Seed mestre do gerador aleatório | 12345 |
-| `run` | Repetição independente (`RngSeedManager::SetRun`) | 1–10 (Etapas 1/2); 1–30 (Etapa 3) |
-| `nodes` | Número de nós | 20 (Etapas 1/2); 10 (Etapa 3) |
-| `area_width_m`, `area_height_m` | Largura e altura do campo | 500 × 500 m; 100 × 50 m na Etapa 3 |
-| `minimum_speed_mps` | Velocidade mínima do RandomWaypoint | 1 m/s |
-| `pause_s` | Pausa do RandomWaypoint | 10 s |
-| `maximum_speeds_mps` | Velocidades máximas do estudo | Etapas 1/2: 1, 5, 10, 20 m/s; Etapa 3: 1, 2, 10, 20 m/s |
-| `flow_pairs` | Pares de nós, origem → destino | 0→1, 2→3, 4→5, 6→7; Etapa 3 0→1 |
-| `rate_pps` | Taxa por fluxo UDP | Etapa 1: 10; Etapa 2: 10 e 100; Etapa 3: 10 e 100 pacotes/s |
-| `packet_size_bytes` | Payload UDP | 512 B |
-| `duration_s` | Duração da simulação incluindo drenagem | 120 s; Etapa 3: 180 s |
-| `traffic_start_s`, `traffic_stop_s` | Intervalo de geração | 10–110 s; Etapa 3: 10–170 s |
-| `useful_duration_s` | Janela usada no throughput | 100 s; Etapa 3: 160 s |
-| `wifi_mode` | Taxa PHY constante (dados e controle) | 802.11g: 6 Mbps; 802.11p: 3 Mbps |
-| `channel_number` / largura | Canal de rádio / MHz | Etapa 1/2: 1 / 20 MHz; Etapa 3: 172 / 10 MHz |
-| `tx_power_dbm` | Potência de transmissão | 16 dBm (Etapas 1/2); 20 dBm (Etapa 3) |
-| Ganho TX/RX | Ganho de antena em dB | 0 / 0 dB |
-| `rx_sensitivity_dbm` | Sensibilidade de recepção | −101 dBm |
-| `rts_cts_threshold_bytes` | Limiar de ativação RTS/CTS | 65535 B |
-| `propagation_delay` | Modelo de atraso de propagação | ConstantSpeedPropagationDelayModel |
-| `range_m` | Limite de alcance, se diferente de zero | Desativado (Etapas 1/2); 50 m (Etapa 3) |
-| LogDistance | Expoente e perda de referência a 1 m | Etapas 1/2: 3 e 40,05 dB; Etapa 3: 2 e 47,86 dB |
-| Streams | Posição inicial / mobilidade | 10 / 1000 |
-| `repetitions` | Runs independentes por célula | 10; mínimo 5 validado; 30 na Etapa 3 |
-
-### Aleatoriedade e repetição
-
-O programa chama `RngSeedManager::SetSeed(seed_master)` e `RngSeedManager::SetRun(run)`. O stream 10 é reservado às posições iniciais uniformes e os streams de mobilidade são atribuídos explicitamente a partir de 1000; não dependem da taxa nem do protocolo. Assim, para cada par velocidade/run, os três protocolos e todas as taxas compartilham a mesma trajetória. O executor calcula SHA-256 do trace, confere os hashes entre execuções e grava-os nos manifestos/CSV. `seed` nas tabelas é a seed mestre; `run` identifica a repetição. Runs oficiais são 1..N. O programa recusa menos de cinco repetições em perfis oficiais; pilotos temporários podem usar 1 ou 3 para validação.
-
-## Um cenário, pilotos e lotes
-
-A partir da raiz do ns-3:
-
-**Uma execução isolada** (não é conjunto para análise estatística):
+### Pilotos
 
 ```bash
-python scripts/run_experiment.py --stage stage1 --protocol aodv --speed 5 --rate 10 --run 1
-```
-
-**Piloto curto da Etapa 1**, uma repetição por célula (12 execuções), em `results/pilot-stage1-1/`:
-
-```bash
-python scripts/run_experiment.py --stage stage1 --pilot --dry-run
+# Um run por célula: 12 execuções na Etapa 1 e 24 na Etapa 2.
 python scripts/run_experiment.py --stage stage1 --pilot
-```
+python scripts/run_experiment.py --stage stage2 --pilot
 
-**Piloto de três runs**, para exercitar IC/testes/gráficos (36 execuções da Etapa 1):
-
-```bash
+# Três runs para exercitar ICs e gráficos (36 execuções da Etapa 1).
 python scripts/run_experiment.py --stage stage1 --pilot-runs 3
 python scripts/analyze.py --stage stage1 --input results/pilot-stage1-3
 ```
 
-O piloto de apenas um run é intencionalmente rejeitado pelo analisador. O piloto de três runs é analisável, mas não é lote oficial e não deve ser misturado a dados oficiais.
+Para a reprodução cruzada de piloto da Etapa 2, deve existir o piloto da Etapa 1 com o mesmo número de runs. O analisador exige pelo menos dois runs por célula; o piloto de um run serve apenas para validar execução, fluxos, traces e manifestos.
 
-**Etapa 1 oficial — 120 execuções:**
+### Lotes oficiais — executar somente após autorização
+
+O mínimo oficial é cinco runs por célula; a configuração padrão usa os intervalos 1–10 e 1–30. O lote da Etapa 2 requer uma Etapa 1 oficial completa para conferir a reprodução das runs 1–10 a 10 pacotes/s.
 
 ```bash
-python scripts/run_experiment.py --stage stage1 --dry-run
-python scripts/run_experiment.py --stage stage1
+python scripts/run_experiment.py --stage stage1 --jobs 4
 python scripts/analyze.py --stage stage1
-```
-
-**Etapa 2 oficial — 240 execuções:**
-
-```bash
-python scripts/run_experiment.py --stage stage2 --dry-run
-python scripts/run_experiment.py --stage stage2
+python scripts/run_experiment.py --stage stage2 --jobs 4
 python scripts/analyze.py --stage stage2
 ```
 
-**Etapa 3 complementar — 720 execuções** (não executar sem decisão do grupo):
+`--jobs N` controla o paralelismo. A execução é retomável quando a saída e a configuração correspondem; saídas incompatíveis são recusadas para evitar sobrescrita acidental. Não execute lotes oficiais até estimar duração e obter autorização.
+
+### Animações
 
 ```bash
-python scripts/run_experiment.py --stage stage3 --dry-run
-python scripts/run_experiment.py --stage stage3
-python scripts/analyze.py --stage stage3
-```
-
-O runner mostra progresso e pode retomar apenas outputs completos do mesmo perfil. Uma pasta preexistente incompatível é recusada; escolha outro `--output`. Paralelismo opcional: `--jobs 4`. Lote completo não foi nem deve ser executado durante validações rápidas.
-
-## Métricas e estatística
-
-`flows.csv` contém uma linha por run/fluxo, com `stage, protocol, speed, rate, run, seed, flowId, txPackets, rxPackets, lostPackets, rxBytes, throughputMbps, pdrPct, delayMs, jitterMs`, além dos campos auxiliares de soma, p95, controle e hash. O `results.csv` tem uma linha por execução: soma tx/rx/perdas/bytes dos fluxos, PDR agregada, throughput, atraso e jitter ponderados, p95, overhead e hash.
-
-- **Throughput (Mbps)** = $rxBytes \times 8 / duração\ útil / 10^6$. `rxBytes` do FlowMonitor inclui cabeçalhos IP/UDP; o throughput dos gráficos é esta métrica, conforme o enunciado.
-- **PDR (%)** = $rxPackets / txPackets \times 100$. `lostPackets` é reportado separadamente.
-- **Atraso (ms)** = `delaySum / rxPackets`. Sem pacote recebido, é ausente (CSV vazio/NaN), nunca zero.
-- **Jitter (ms)** = `jitterSum / (rxPackets − 1)` por fluxo. Com zero ou um pacote recebido, é ausente. Na execução, atraso é ponderado por pacotes recebidos; jitter combinado usa o total de amostras de pares consecutivos por fluxo.
-- **P95** por fluxo é estimado pelo centro do bin do histograma FlowMonitor. No `results.csv` por execução, o p95 reportado é uma aproximação ponderada pelos pacotes recebidos dos p95 dos fluxos, não o percentil exato da união das amostras; fica explicitamente separado da média exata.
-- **Overhead** (Etapa 2 e adicionalmente nas demais saídas) conta datagramas UDP da porta de controle de AODV/DSDV/OLSR na camada Tx IPv4. Inclui pacotes/bytes de controle, bytes de controle por byte útil (payload recebido) e pacotes por pacote entregue; não mede airtime ou energia.
-
-O analisador valida duração útil, completude de fluxo/run/célula, XML, seed, configuração e hashes. Rejeita rx > tx, perdas > tx, divisão por zero, PDR fora de 0–100%, atraso/jitter negativos, duplicatas e faltantes. Fluxos sem recepção são válidos como resultado de rede: PDR 0 e atraso/jitter ausentes, com aviso claro. Médias excluem valores ausentes e informam `n_valid`.
-
-As médias, desvios padrão e IC 95% usam t de Student. Comparações são pareadas pelo run. Com menos de 10 pares, o analisador apresenta IC e não declara significância por teste; com 10 ou mais usa t pareado e correção de Holm nas comparações múltiplas. Isso evita interpretar p-valores pouco informativos em amostras pequenas. Os resultados também imprimem tendências por velocidade, ponto de maior degradação e contagem de ICs sobrepostos entre protocolos. Texto neutro, sem eleger “melhor” protocolo. Uma afirmação de entrega confiável deve respeitar `minimum_reliable_pdr_pct` definido previamente no JSON.
-
-## Dados, figuras, logs e animações
-
-Dados oficiais ficam separados por etapa e são destinados ao versionamento:
-
-- `experiments/manet-routing/data/raw/<stage>/`: `manifest.json`, cópia de `config.json`, `flows.csv`, XML FlowMonitor, traces de mobilidade e manifesto/CSV por run.
-- `experiments/manet-routing/data/processed/<stage>/`: `flows.csv`, `results.csv`, `summary.csv` e `paired-tests.csv`.
-- `experiments/manet-routing/figures/<stage>/`: PNGs com barras de IC 95% e unidades. Etapa 2 gera arquivos por taxa.
-- `results/`: pilotos, execução isolada e animações; ignorados pelo Git. `--animation` gera 1 run × 4 velocidades × 3 protocolos = **12 XMLs** do perfil-base; não escreve em `data/` nem é analisado.
-
-Para gerar as animações:
-
-```bash
-python scripts/run_experiment.py --stage stage1 --animation --dry-run
 python scripts/run_experiment.py --stage stage1 --animation
 ```
 
-Os XMLs ficam em `results/animation-stage1/animation/<velocidade>/<protocolo>/run-1.xml`. Abra no NetAnim por **File > Open XML**. Nó 0/origem é vermelho; nó 1/destino azul; os outros são amarelos. Descrições identificam protocolo, velocidade, taxa/run. `AnimationInterface` habilita metadados e captura de tabela de rotas IPv4 quando suportado. O runner compara o hash da trajetória visual com uma execução sem animação. Se não existir baseline oficial completa, cria uma execução baseline temporária separada sob `results/animation-stage1/baseline/`.
+O conjunto tem 12 XMLs: uma run, quatro velocidades e três protocolos. O simulador usa `AnimationInterface` e `SetMaxPktsPerTraceFile` para segmentar traces grandes. Para compilar o aplicativo NetAnim separado, use Qt 5 e siga a receita compatível com ns-3.39. Animações são apenas visuais e ficam sob `results/`.
 
-Reduza a janela de animação ou o limite de pacotes no perfil para controlar XML grande; reproduza em velocidade menor para observar mobilidade. Se a tela estiver vazia, confirme que abriu XML da pasta `animation`, que o playback está entre 10 e 110 s e que não abriu o XML FlowMonitor. Sem pacotes visíveis, confira filtros e janela do playback. Falha de abertura costuma indicar versão NetAnim/Qt incompatível.
+## Saídas e versionamento
 
-Após cada piloto, o runner mede o volume observado e projeta o tamanho oficial pela razão entre runs esperados e realizados, registrando ambos no manifesto e imprimindo a estimativa. Se a projeção passar de 50 MiB, o lote oficial grava os XMLs FlowMonitor em gzip; se não houver piloto prévio, mede ao terminar e compacta caso o limite seja ultrapassado. O analisador lê XML normal ou gzip. CSVs, manifestos, traces/hash e figuras permanecem preservados. Não se estima tamanho de dados ainda não gerados como se fosse medição.
+- Dados brutos oficiais: `experiments/manet-routing/data/raw/stage1/` e `stage2/` — manifestos, CSVs por fluxo, traces de mobilidade e XMLs FlowMonitor.
+- Dados processados: `experiments/manet-routing/data/processed/<etapa>/` — `flows.csv`, `results.csv`, `summary.csv`, `h1-results.csv`, `h1-summary.md` e, na Etapa 2, `saturation-check.md`.
+- Figuras: `experiments/manet-routing/figures/<etapa>/` — quatro PNGs por etapa, com unidades e ICs.
+- Pilotos e animações: `results/`, ignorado pelo Git.
 
-## Como interpretar os resultados
-
-- **PDR** mostra a porcentagem de pacotes entregues. Um PDR baixo significa que muitos pacotes não chegaram.
-- **Throughput** mede quantos bits recebidos por segundo o FlowMonitor observou durante a janela útil. Inclui cabeçalhos IP/UDP; por isso não é exatamente payload útil.
-- **Atraso** mede quanto tempo os pacotes recebidos levaram, em média, da origem ao destino. **Jitter** resume a variação do atraso entre chegadas consecutivas.
-- Barras de erro largas indicam maior incerteza entre runs. ICs sobrepostos não provam igualdade; ICs não sobrepostos, sozinhos, também não substituem o teste pareado.
-- A Etapa 2 permite observar se a carga altera métricas e overhead mantendo o restante do cenário. Resultado nenhum deve ser generalizado para redes maiores ou outros parâmetros.
-- H1: avaliar se a mobilidade crescente acompanha atraso maior e/ou PDR menor. H2: avaliar diferenças entre protocolos sob as mesmas seeds/trajetórias. H3: comparar os custos de controle. Se os intervalos não derem evidência suficiente, escrever “inconclusivo”.
-
-### Glossário
-
-- **MANET:** rede móvel ad hoc, sem infraestrutura central fixa.
-- **AODV:** roteamento sob demanda; busca rotas quando necessário.
-- **OLSR:** roteamento proativo com retransmissores multiponto.
-- **DSDV:** roteamento proativo por vetor de distâncias sequenciado.
-- **PDR:** taxa de entrega de pacotes, expressa em porcentagem.
-- **Throughput:** bits recebidos por segundo, conforme a definição do experimento.
-- **Goodput:** bits de payload útil recebidos por segundo; diferente de throughput que inclui cabeçalhos.
-- **Overhead:** tráfego de controle medido no ponto instrumentado.
-- **Seed/run:** seed mestre e repetição determinística do gerador aleatório.
-- **NetAnim:** visualizador Qt de XMLs de animação do ns-3.
-
-## Correspondência com o enunciado
-
-| Estrutura indicada | Arquivo deste projeto |
-|---|---|
-| `src/manet-routing.cc` | `scratch/manet-routing-compare.cc` |
-| `run_batch.sh` | `scripts/run_experiment.py` |
-| `analyze.py` | `scripts/analyze.py` |
-| `data/raw/` | `experiments/manet-routing/data/raw/` |
-| `data/processed/` | `experiments/manet-routing/data/processed/` |
-| `figures/` | `experiments/manet-routing/figures/` |
-| `article/` | Será criado pelo grupo; não faz parte deste repositório por enquanto. |
-
-## Checklist de reprodução
-
-- [ ] Registrar nomes do grupo e revisar a pergunta/hipóteses dos slides.
-- [ ] Clonar checkout do ns-3.39, instalar compilador/Python/Qt necessários e guardar revisão reportada pelo manifesto.
-- [ ] Conferir `config/experiment.json`; não reduzir abaixo de cinco runs oficiais.
-- [ ] Configurar/compilar `scratch_manet-routing-compare`.
-- [ ] Rodar piloto da Etapa 1 e testar hashes, 4 fluxos, jitter e CSVs.
-- [ ] Rodar piloto de três runs e analisar para exercitar ICs e gráficos.
-- [ ] Executar lote oficial das Etapas 1 e 2 somente quando autorizado; Etapa 3 é complementar e opcional.
-- [ ] Executar `scripts/analyze.py` separadamente para cada etapa e revisar métricas/síntese sem misturar pilotos.
-- [ ] Verificar tamanho dos dados, figuras e manifestos; versionar CSVs, XMLs brutos dentro do limite acordado e PNGs.
-- [ ] Preencher “Commit da versão do artigo” somente após o commit final realizado pelo grupo.
-
-A especificação anterior do repositório permanece em `docs/ESPECIFICACAO.md` sem alteração; ela descreve um cenário antigo e não é a fonte de parâmetros deste estudo.
+O runner estima o tamanho a partir de dados realmente observados nos pilotos e pode compactar XMLs FlowMonitor se o lote oficial projetado ultrapassar 50 MiB. Antes de publicar os dados, confira o tamanho e os manifestos. Eles registram versão do ns-3, revisão, seed, run, comando, configuração e hash da trajetória.

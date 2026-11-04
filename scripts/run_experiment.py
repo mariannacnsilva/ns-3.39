@@ -25,18 +25,17 @@ PROTOCOLS = ("aodv", "olsr", "dsdv")
 def load_config(path: Path = CONFIG_PATH) -> dict:
     config = json.loads(path.read_text(encoding="utf-8"))
     experiment = config["experiment"]
-    if experiment["confidence_method"] != "student-t" or experiment["multiple_comparison_correction"] != "holm":
-        raise ValueError("Análise configurada para IC t de Student e correção de Holm; opção incompatível no JSON.")
-    if experiment["paired_test_small_n"] != "confidence-interval-only" or experiment["paired_test_large_n"] != "paired-t":
-        raise ValueError("Para n pequeno usa-se apenas IC; para amostras maiores usa-se t pareado.")
     if len(experiment["protocols"]) != len(set(experiment["protocols"])):
         raise ValueError("A lista de protocolos contém duplicatas.")
     minimum = config["experiment"]["minimum_repetitions"]
-    for stage in ("stage1", "stage2", "stage3"):
+    for stage in ("stage1", "stage2"):
         profile = resolve_profile(config, stage)
         repetitions = profile["repetitions"]
         if repetitions < minimum:
             raise ValueError(f"{stage}: repetições={repetitions}; mínimo permitido={minimum}.")
+        run_range = experiment["run_ranges"][stage]
+        if run_range != [1, repetitions]:
+            raise ValueError(f"{stage}: run_ranges deve ser [1, {repetitions}].")
         if len(profile["flow_pairs"]) < 1:
             raise ValueError(f"{stage}: configure ao menos um fluxo.")
         if profile["traffic_stop_s"] - profile["traffic_start_s"] != profile["useful_duration_s"]:
@@ -135,13 +134,12 @@ def git_metadata(directory: Path) -> dict:
         if result.returncode:
             return ""
         return result.stdout.strip()
-    revision = read_git("rev-parse", "HEAD")
-    description = read_git("describe", "--always", "--dirty")
+    revision = read_git("log", "-1", "--format=%H")
     status = read_git("status", "--short")
     if not revision:
-        return {"revision": None, "describe": None,
+        return {"revision": None,
                 "reason": "diretório sem metadados Git acessíveis; o código foi executado a partir dos arquivos locais."}
-    return {"revision": revision, "describe": description,
+    return {"revision": revision,
             "working_tree_dirty": bool(status), "status_short": status.splitlines()}
 
 
@@ -177,13 +175,11 @@ def build_command(config: dict, profile: dict, run: tuple, root: Path,
             f"--tx-gain={profile['tx_gain_db']}", f"--rx-gain={profile['rx_gain_db']}",
             f"--rx-sensitivity={profile['rx_sensitivity_dbm']}",
             f"--rts-cts-threshold={profile['rts_cts_threshold_bytes']}",
-            f"--range={profile.get('range_m', 0.0)}", f"--reference-loss={profile['reference_loss_db']}",
+            f"--reference-loss={profile['reference_loss_db']}",
             f"--reference-distance={profile['reference_distance_m']}",
             f"--path-loss-exponent={profile['log_distance_exponent']}",
             f"--propagation-delay=ns3::{profile['propagation_delay']}",
             f"--application-port={profile['application_port']}",
-            f"--control-port={profile['control_port_' + protocol]}",
-            f"--delay-percentile={config['metrics']['delay_percentile']}",
             f"--ip-network={config['ipv4']['network']}", f"--ip-mask={config['ipv4']['mask']}",
             f"--packet-size={profile['packet_size_bytes']}",
             f"--initial-position-stream={profile['initial_position_stream']}",
@@ -328,9 +324,75 @@ def collect_stage_csvs(root: Path, stage: str) -> None:
                     writer.writerow(row)
 
 
+def verify_stage2_reproduction(root: Path, mode: str, repetitions: int) -> None:
+    """Require Stage 2's 10 pps runs 1-10 to reproduce Stage 1 exactly."""
+    if mode == "official":
+        baseline = EXPERIMENT_DIR / "data" / "raw" / "stage1"
+    elif mode == "pilot":
+        baseline = ROOT / "results" / f"pilot-stage1-{repetitions}"
+    else:
+        return
+    baseline_manifest_path = baseline / "manifest.json"
+    if not baseline_manifest_path.exists():
+        raise ValueError(f"Não foi encontrada a Etapa 1 correspondente para validar a reprodução: {baseline}")
+    baseline_manifest = json.loads(baseline_manifest_path.read_text(encoding="utf-8"))
+    if baseline_manifest.get("mode") != mode or baseline_manifest.get("stage") != "stage1":
+        raise ValueError("A referência da Etapa 1 não corresponde ao modo/perfil da Etapa 2.")
+    if mode == "official" and baseline_manifest.get("completed_runs") != baseline_manifest.get("expected_runs"):
+        raise ValueError("A Etapa 1 oficial está incompleta; não é possível validar reprodução da Etapa 2.")
+
+    compared = 0
+    for stage2_manifest_path in sorted((root / "runs").glob("*.manifest.json")):
+        stage2 = json.loads(stage2_manifest_path.read_text(encoding="utf-8"))
+        if stage2.get("rate") != 10 or int(stage2.get("run", 0)) > 10:
+            continue
+        baseline_tag = (f"{stage2['protocol']}-v{stage2['speed']:g}-r10-"
+                        f"run-{int(stage2['run']):03d}")
+        baseline_run_manifest_path = baseline / "runs" / f"{baseline_tag}.manifest.json"
+        if not baseline_run_manifest_path.exists():
+            raise ValueError(f"Manifesto base ausente para comparação exata: {baseline_run_manifest_path}")
+        baseline_run = json.loads(baseline_run_manifest_path.read_text(encoding="utf-8"))
+        if stage2["trajectory_sha256"] != baseline_run["trajectory_sha256"]:
+            raise ValueError(f"Trajetória divergiu entre etapas: {baseline_tag}")
+        stage2_csv = root / stage2["files"]["flows"]
+        baseline_csv = baseline / baseline_run["files"]["flows"]
+        with stage2_csv.open(encoding="utf-8", newline="") as handle:
+            stage2_rows = list(csv.DictReader(handle))
+        with baseline_csv.open(encoding="utf-8", newline="") as handle:
+            baseline_rows = list(csv.DictReader(handle))
+        omit = {"stage", "trajectorySha256"}
+        comparable_fields = sorted((set(stage2_rows[0]) & set(baseline_rows[0])) - omit) if stage2_rows and baseline_rows else []
+        if not comparable_fields or len(stage2_rows) != len(baseline_rows):
+            raise ValueError(f"CSV por fluxo ausente/incompatível na comparação: {baseline_tag}")
+        for row2, row1 in zip(stage2_rows, baseline_rows):
+            if any(row2[field] != row1[field] for field in comparable_fields):
+                raise ValueError(f"Métricas da Etapa 2 não reproduzem a Etapa 1: {baseline_tag}")
+        compared += 1
+    expected_compared = len(PROTOCOLS) * 4 * min(repetitions, 10)
+    if compared != expected_compared:
+        raise ValueError(f"Comparações de reprodução incompletas: {compared}/{expected_compared}.")
+
+
+def require_stage1_baseline(mode: str, repetitions: int) -> None:
+    if mode == "official":
+        baseline = EXPERIMENT_DIR / "data" / "raw" / "stage1"
+    elif mode == "pilot":
+        baseline = ROOT / "results" / f"pilot-stage1-{repetitions}"
+    else:
+        return
+    manifest_path = baseline / "manifest.json"
+    if not manifest_path.exists():
+        raise ValueError(f"Execute primeiro a Etapa 1 correspondente; referência ausente: {baseline}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("mode") != mode or manifest.get("stage") != "stage1":
+        raise ValueError("A referência existente não corresponde à Etapa 1 do mesmo modo.")
+    if mode == "official" and manifest.get("completed_runs") != manifest.get("expected_runs"):
+        raise ValueError("Conclua a Etapa 1 oficial antes de iniciar a Etapa 2.")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--stage", choices=("stage1", "stage2", "stage3"), default="stage1")
+    parser.add_argument("--stage", choices=("stage1", "stage2"), default="stage1")
     parser.add_argument("--config", type=Path, default=CONFIG_PATH)
     parser.add_argument("--pilot", action="store_true", help="piloto curto de uma repetição por célula")
     parser.add_argument("--pilot-runs", type=int, help="número de runs do piloto (mínimo 2 para análise)")
@@ -351,7 +413,7 @@ def main() -> int:
     config = load_config(args.config)
     profile = resolve_profile(config, args.stage)
     if args.animation and args.stage != "stage1":
-        parser.error("As animações do trabalho final usam apenas o cenário-base (stage1).")
+        parser.error("As animações deste estudo usam apenas o cenário-base (stage1).")
     pilot_count = args.pilot_runs if args.pilot_runs is not None else (1 if args.pilot else None)
     if pilot_count is not None and pilot_count < 1:
         parser.error("--pilot-runs deve ser positivo.")
@@ -369,6 +431,8 @@ def main() -> int:
         for protocol, speed, rate, run_id in runs:
             print(f"{protocol} | {speed:g} m/s | {rate} pps/fluxo | run={run_id} | seed={config['experiment']['seed_master']}")
         return 0
+    if args.stage == "stage2" and mode in ("official", "pilot"):
+        require_stage1_baseline(mode, pilot_count or profile["repetitions"])
     if root.exists() and any(root.iterdir()):
         manifest_path = root / "manifest.json"
         if not manifest_path.exists():
@@ -455,6 +519,13 @@ def main() -> int:
         metadata["animation_hashes_match_baseline"] = matches
         failed |= not matches
     collect_stage_csvs(root, args.stage)
+    if args.stage == "stage2" and not args.animation:
+        try:
+            verify_stage2_reproduction(root, mode, pilot_count or profile["repetitions"])
+            metadata["stage1_reproduction_verified"] = True
+        except (OSError, ValueError, KeyError) as error:
+            print(f"Erro na reprodução Etapa 1/2: {error}", file=sys.stderr)
+            failed = True
     if mode == "official":
         uncompressed_bytes = uncompressed_directory_size(root)
         if compress_xml or uncompressed_bytes > size_limit_bytes:

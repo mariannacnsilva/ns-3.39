@@ -55,15 +55,12 @@ struct Options
     double rxGainDb{0.0};
     double rxSensitivityDbm{-101.0};
     uint32_t rtsCtsThresholdBytes{65535};
-    double rangeM{0.0};
     double referenceLossDb{46.6777};
     double referenceDistanceM{1.0};
     double pathLossExponent{3.0};
     std::string propagationDelay{"ns3::ConstantSpeedPropagationDelayModel"};
     uint16_t applicationPort{9000};
-    uint16_t controlPort{654};
     uint32_t packetSizeBytes{512};
-    double delayPercentile{0.95};
     std::string ipNetwork{"10.0.0.0"};
     std::string ipMask{"255.0.0.0"};
     int64_t initialPositionStream{10};
@@ -108,14 +105,14 @@ Validate(const Options& o, const std::vector<std::pair<uint32_t, uint32_t>>& pai
         std::cerr << "Erro: --protocol deve ser aodv, dsdv ou olsr.\n";
         return false;
     }
-    if (o.stage != "stage1" && o.stage != "stage2" && o.stage != "stage3")
+    if (o.stage != "stage1" && o.stage != "stage2")
     {
-        std::cerr << "Erro: --stage deve ser stage1, stage2 ou stage3.\n";
+        std::cerr << "Erro: --stage deve ser stage1 ou stage2.\n";
         return false;
     }
     if (o.run == 0 || o.seedMaster == 0 || o.ratePps == 0 || o.flowCount == 0 ||
         o.flowCount != pairs.size() || o.nodes < 2 || o.packetSizeBytes == 0 ||
-        o.applicationPort == 0 || o.controlPort == 0 || o.applicationPort == o.controlPort ||
+        o.applicationPort == 0 ||
         o.initialPositionStream < 0 || o.mobilityStream < 0 ||
         o.initialPositionStream == o.mobilityStream)
     {
@@ -136,16 +133,12 @@ Validate(const Options& o, const std::vector<std::pair<uint32_t, uint32_t>>& pai
         std::cerr << "Erro: duração, tráfego, mobilidade ou área fora dos limites válidos.\n";
         return false;
     }
-    if (o.wifiStandard != "802.11g" && o.wifiStandard != "802.11p")
+    if (o.wifiStandard != "802.11g")
     {
-        std::cerr << "Erro: padrão Wi-Fi suportado neste experimento: 802.11g ou 802.11p.\n";
+        std::cerr << "Erro: este experimento usa somente IEEE 802.11g.\n";
         return false;
     }
-    const bool wifiSettingsMatch = (o.wifiStandard == "802.11g" &&
-        o.wifiMode == "ErpOfdmRate6Mbps" && o.channelWidthMhz == 20) ||
-        (o.wifiStandard == "802.11p" &&
-         o.wifiMode == "OfdmRate3MbpsBW10MHz" && o.channelWidthMhz == 10);
-    if (!wifiSettingsMatch || o.channelNumber == 0)
+    if (o.wifiMode != "ErpOfdmRate6Mbps" || o.channelWidthMhz != 20 || o.channelNumber != 1)
     {
         std::cerr << "Erro: padrão, modo PHY, largura e canal Wi-Fi não formam um perfil compatível.\n";
         return false;
@@ -157,9 +150,7 @@ Validate(const Options& o, const std::vector<std::pair<uint32_t, uint32_t>>& pai
         !std::isfinite(o.referenceDistanceM) || o.referenceDistanceM <= 0 ||
         !std::isfinite(o.pathLossExponent) || o.pathLossExponent <= 0 ||
         o.propagationDelay != "ns3::ConstantSpeedPropagationDelayModel" ||
-        !std::isfinite(o.rangeM) || o.rangeM < 0 ||
         !std::isfinite(o.mobilityTraceIntervalS) || o.mobilityTraceIntervalS <= 0 ||
-        !std::isfinite(o.delayPercentile) || o.delayPercentile <= 0 || o.delayPercentile >= 1 ||
         o.ipNetwork.empty() || o.ipMask.empty() ||
         o.flowsPath.empty() || o.mobilityPath.empty() || o.flowMonitorPath.empty())
     {
@@ -219,18 +210,6 @@ InstallRouting(InternetStackHelper& stack, const std::string& protocol)
     }
 }
 
-WifiStandard
-WifiStandardFromName(const std::string& name)
-{
-    return name == "802.11p" ? WIFI_STANDARD_80211p : WIFI_STANDARD_80211g;
-}
-
-std::string
-WifiBand(const std::string& name)
-{
-    return name == "802.11p" ? "BAND_5GHZ" : "BAND_2_4GHZ";
-}
-
 void
 ConfigureAnimation(AnimationInterface& animation,
                    const NodeContainer& nodes,
@@ -257,11 +236,6 @@ ConfigureAnimation(AnimationInterface& animation,
     }
 }
 
-void
-SetVariable(std::string& target, const std::string& description, CommandLine& command)
-{
-    command.AddValue(description, description, target);
-}
 } // namespace
 
 int
@@ -295,15 +269,12 @@ main(int argc, char* argv[])
     ADD("rx-gain", "Ganho de recepção (dB)", rxGainDb);
     ADD("rx-sensitivity", "Sensibilidade de recepção (dBm)", rxSensitivityDbm);
     ADD("rts-cts-threshold", "Limiar RTS/CTS (bytes)", rtsCtsThresholdBytes);
-    ADD("range", "Alcance nominal opcional (m; 0 desabilita)", rangeM);
     ADD("reference-loss", "Perda de referência (dB)", referenceLossDb);
     ADD("reference-distance", "Distância de referência (m)", referenceDistanceM);
     ADD("path-loss-exponent", "Expoente LogDistance", pathLossExponent);
     ADD("propagation-delay", "Modelo de atraso de propagação", propagationDelay);
     ADD("application-port", "Porta UDP de aplicação", applicationPort);
-    ADD("control-port", "Porta UDP de controle do protocolo", controlPort);
     ADD("packet-size", "Payload UDP (bytes)", packetSizeBytes);
-    ADD("delay-percentile", "Percentil do atraso para FlowMonitor", delayPercentile);
     ADD("ip-network", "Rede IPv4", ipNetwork);
     ADD("ip-mask", "Máscara IPv4", ipMask);
     ADD("initial-position-stream", "Stream explícito para posições iniciais", initialPositionStream);
@@ -337,15 +308,15 @@ main(int argc, char* argv[])
     nodes.Create(o.nodes);
 
     WifiHelper wifi;
-    wifi.SetStandard(WifiStandardFromName(o.wifiStandard));
+    wifi.SetStandard(WIFI_STANDARD_80211g);
     wifi.SetRemoteStationManager("ns3::ConstantRateWifiManager", "DataMode", StringValue(o.wifiMode),
                                  "ControlMode", StringValue(o.wifiMode),
                                  "NonUnicastMode", StringValue(o.wifiMode),
                                  "RtsCtsThreshold", UintegerValue(o.rtsCtsThresholdBytes));
     YansWifiPhyHelper phy;
     std::ostringstream channelSettings;
-    channelSettings << "{" << o.channelNumber << ", " << o.channelWidthMhz << ", "
-                    << WifiBand(o.wifiStandard) << ", 0}";
+    channelSettings << "{" << o.channelNumber << ", " << o.channelWidthMhz
+                    << ", BAND_2_4GHZ, 0}";
     phy.Set("ChannelSettings", StringValue(channelSettings.str()));
     phy.Set("TxPowerStart", DoubleValue(o.txPowerDbm));
     phy.Set("TxPowerEnd", DoubleValue(o.txPowerDbm));
@@ -354,8 +325,6 @@ main(int argc, char* argv[])
     phy.Set("RxSensitivity", DoubleValue(o.rxSensitivityDbm));
     YansWifiChannelHelper channel;
     channel.SetPropagationDelay(o.propagationDelay);
-    if (o.rangeM > 0)
-        channel.AddPropagationLoss("ns3::RangePropagationLossModel", "MaxRange", DoubleValue(o.rangeM));
     channel.AddPropagationLoss("ns3::LogDistancePropagationLossModel", "Exponent", DoubleValue(o.pathLossExponent),
                                "ReferenceDistance", DoubleValue(o.referenceDistanceM),
                                "ReferenceLoss", DoubleValue(o.referenceLossDb));
@@ -393,9 +362,6 @@ main(int argc, char* argv[])
     address.SetBase(o.ipNetwork.c_str(), o.ipMask.c_str());
     Ipv4InterfaceContainer interfaces = address.Assign(devices);
 
-    experiment::ControlTrafficCounter control(o.controlPort);
-    Config::ConnectWithoutContext("/NodeList/*/$ns3::Ipv4L3Protocol/Tx",
-        MakeCallback(&experiment::ControlTrafficCounter::OnIpv4Tx, &control));
     for (const auto& pair : pairs)
     {
         PacketSinkHelper sink("ns3::UdpSocketFactory",
@@ -415,8 +381,7 @@ main(int argc, char* argv[])
 
     FlowMonitorHelper flowHelper;
     Ptr<FlowMonitor> monitor = flowHelper.InstallAll();
-    experiment::MobilityRecorder recorder(nodes, o.areaWidthM, o.areaHeightM, o.durationS,
-        o.rangeM > 0 ? o.rangeM : 0.0, o.mobilityTraceIntervalS, o.mobilityPath);
+    experiment::MobilityRecorder recorder(nodes, o.durationS, o.mobilityTraceIntervalS, o.mobilityPath);
     if (!recorder.IsOpen())
     {
         std::cerr << "Erro: não foi possível criar o trace de mobilidade: " << o.mobilityPath << "\n";
@@ -433,7 +398,7 @@ main(int argc, char* argv[])
     Simulator::Stop(Seconds(o.durationS));
     Simulator::Run();
     monitor->CheckForLostPackets();
-    monitor->SerializeToXmlFile(o.flowMonitorPath, true, true);
+    monitor->SerializeToXmlFile(o.flowMonitorPath, false, false);
 
     Ptr<Ipv4FlowClassifier> classifier = DynamicCast<Ipv4FlowClassifier>(flowHelper.GetClassifier());
     const auto& flowStats = monitor->GetFlowStats();
@@ -444,7 +409,7 @@ main(int argc, char* argv[])
         Simulator::Destroy();
         return 2;
     }
-    output << "stage,protocol,speed,rate,run,seed,flowId,txPackets,rxPackets,lostPackets,rxBytes,throughputMbps,pdrPct,delayMs,jitterMs,p95Ms,delaySumMs,jitterSumMs,controlPackets,controlBytes,maxPackets,flowIndex,sourceNode,destinationNode,packetSizeBytes,meanGeometricDegree\n";
+    output << "stage,protocol,speed,rate,run,seed,flowId,txPackets,rxPackets,lostPackets,rxBytes,throughputMbps,pdrPct,delayMs,jitterMs,delaySumMs,jitterSumMs,maxPackets,flowIndex,sourceNode,destinationNode,packetSizeBytes\n";
     output << std::setprecision(17);
     for (size_t index = 0; index < pairs.size(); ++index)
     {
@@ -463,34 +428,15 @@ main(int argc, char* argv[])
             const double jitterSumMs = stats.jitterSum.GetSeconds() * 1000.0;
             const double delayMs = stats.rxPackets ? delaySumMs / stats.rxPackets : std::numeric_limits<double>::quiet_NaN();
             const double jitterMs = stats.rxPackets > 1 ? jitterSumMs / (stats.rxPackets - 1) : std::numeric_limits<double>::quiet_NaN();
-            uint64_t histogramTotal = 0;
-            for (uint32_t bin = 0; bin < stats.delayHistogram.GetNBins(); ++bin)
-                histogramTotal += stats.delayHistogram.GetBinCount(bin);
-            double p95Ms = std::numeric_limits<double>::quiet_NaN();
-            if (histogramTotal)
-            {
-                const uint64_t cutoff = static_cast<uint64_t>(std::ceil(histogramTotal * o.delayPercentile));
-                uint64_t cumulative = 0;
-                for (uint32_t bin = 0; bin < stats.delayHistogram.GetNBins(); ++bin)
-                {
-                    cumulative += stats.delayHistogram.GetBinCount(bin);
-                    if (cumulative >= cutoff)
-                    {
-                        p95Ms = (bin + 0.5) * stats.delayHistogram.GetBinWidth(bin) * 1000.0;
-                        break;
-                    }
-                }
-            }
             const uint32_t maxPackets = static_cast<uint32_t>(std::ceil(o.ratePps * (o.trafficStopS - o.trafficStartS)) + 1.0);
             const double throughputMbps = stats.rxBytes * 8.0 / ((o.trafficStopS - o.trafficStartS) * 1e6);
             const double pdrPct = stats.txPackets ? 100.0 * stats.rxPackets / stats.txPackets : std::numeric_limits<double>::quiet_NaN();
             output << o.stage << ',' << o.protocol << ',' << o.speed << ',' << o.ratePps << ',' << o.run << ','
                    << o.seedMaster << ',' << entry.first << ',' << stats.txPackets << ',' << stats.rxPackets << ','
                    << stats.lostPackets << ',' << stats.rxBytes << ',' << throughputMbps << ',' << pdrPct << ','
-                   << delayMs << ',' << jitterMs << ',' << p95Ms << ',' << delaySumMs << ',' << jitterSumMs << ','
-                   << control.Packets() << ',' << control.Bytes() << ',' << maxPackets << ',' << index << ','
-                   << pair.first << ',' << pair.second << ',' << o.packetSizeBytes << ','
-                   << recorder.MeanDegree() << '\n';
+                   << delayMs << ',' << jitterMs << ',' << delaySumMs << ',' << jitterSumMs << ','
+                   << maxPackets << ',' << index << ',' << pair.first << ',' << pair.second << ','
+                   << o.packetSizeBytes << '\n';
         }
         if (!found)
         {

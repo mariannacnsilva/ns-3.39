@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
-"""Valida e analisa uma etapa isolada do estudo MANET."""
+"""Valida e analisa somente H1 e as quatro métricas do estudo MANET."""
 from __future__ import annotations
 
 import argparse
 import csv
-import gzip
 import hashlib
 import json
 import math
 import sys
 from pathlib import Path
-from xml.etree import ElementTree as ET
 
 import matplotlib
 matplotlib.use("Agg")
@@ -23,21 +21,25 @@ ROOT = Path(__file__).resolve().parents[1]
 EXPERIMENT_DIR = ROOT / "experiments" / "manet-routing"
 FLOW_COLUMNS = ["stage", "protocol", "speed", "rate", "run", "seed", "flowId",
                 "txPackets", "rxPackets", "lostPackets", "rxBytes", "throughputMbps",
-                "pdrPct", "delayMs", "jitterMs", "p95Ms", "delaySumMs", "jitterSumMs",
-                "controlPackets", "controlBytes", "maxPackets", "flowIndex", "packetSizeBytes",
-                "sourceNode", "destinationNode", "meanGeometricDegree", "trajectorySha256"]
+                "pdrPct", "delayMs", "jitterMs", "delaySumMs", "jitterSumMs",
+                "maxPackets", "flowIndex", "sourceNode", "destinationNode",
+                "packetSizeBytes", "trajectorySha256"]
+METRICS = {
+    "throughputMbps": ("Vazão (Mbps)", "higher"),
+    "pdrPct": ("PDR (%)", "higher"),
+    "delayMs": ("Atraso médio (ms)", "lower"),
+    "jitterMs": ("Jitter médio (ms)", "lower"),
+}
 
 
 def pdr_pct(received: int, transmitted: int) -> float:
-    if transmitted <= 0:
-        raise ValueError("PDR indefinido: txPackets deve ser maior que zero")
-    return 100.0 * received / transmitted
+    return 100.0 * received / transmitted if transmitted > 0 else math.nan
 
 
 def throughput_mbps(received_bytes: int, useful_duration_s: float,
                     bytes_per_megabit: float = 1e6) -> float:
-    if useful_duration_s <= 0:
-        raise ValueError("A duração útil deve ser positiva")
+    if useful_duration_s <= 0 or bytes_per_megabit <= 0:
+        raise ValueError("A duração útil e os bytes por megabit devem ser positivos.")
     return received_bytes * 8.0 / useful_duration_s / bytes_per_megabit
 
 
@@ -49,261 +51,25 @@ def jitter_ms(jitter_sum_ms: float, received: int) -> float:
     return jitter_sum_ms / (received - 1) if received > 1 else math.nan
 
 
-def percentile_from_xml(flow: ET.Element, quantile: float) -> float:
-    histogram = flow.find("delayHistogram")
-    if histogram is None or not 0 < quantile < 1:
-        return math.nan
-    bins = sorted(histogram.findall("bin"), key=lambda item: int(item.get("index", "0")))
-    total = sum(int(item.get("count", "0")) for item in bins)
-    if total == 0:
-        return math.nan
-    target = math.ceil(total * quantile)
-    cumulative = 0
-    for item in bins:
-        cumulative += int(item.get("count", "0"))
-        if cumulative >= target:
-            return (float(item.get("start", "0")) + float(item.get("width", "0")) / 2) * 1000
-    return math.nan
-
-
-def validate_analysis_repetitions(repetitions: int, mode: str,
-                                  official_minimum: int) -> None:
-    if repetitions < 2:
-        raise ValueError("A análise exige pelo menos 2 runs por célula; este piloto tem apenas 1.")
-    if mode == "official" and repetitions < official_minimum:
-        raise ValueError(f"Execução oficial abaixo do mínimo de repetições ({official_minimum}).")
-
-
 def aggregate_flows(flows: list[dict], useful_duration_s: float,
                     bytes_per_megabit: float = 1e6) -> dict:
     tx = sum(int(flow["txPackets"]) for flow in flows)
     rx = sum(int(flow["rxPackets"]) for flow in flows)
     lost = sum(int(flow["lostPackets"]) for flow in flows)
     rx_bytes = sum(int(flow["rxBytes"]) for flow in flows)
-    delay_sum = sum(float(flow.get("delaySumMs", 0) or 0) for flow in flows)
-    jitter_sum = sum(float(flow.get("jitterSumMs", 0) or 0) for flow in flows)
-    jitter_pairs = sum(max(int(flow["rxPackets"]) - 1, 0) for flow in flows)
-    p95_values = [(float(flow["p95Ms"]), int(flow["rxPackets"])) for flow in flows
-                  if _number(flow.get("p95Ms")) and int(flow["rxPackets"]) > 0]
-    p95 = (sum(value * count for value, count in p95_values) / sum(count for _, count in p95_values)
-           if p95_values else math.nan)
-    payload_size = int(float(flows[0]["packetSizeBytes"])) if flows else 0
-    control_bytes = int(float(flows[0].get("controlBytes", 0) or 0)) if flows else 0
-    return {"txPackets": tx, "rxPackets": rx, "lostPackets": lost, "rxBytes": rx_bytes,
-            "throughputMbps": throughput_mbps(rx_bytes, useful_duration_s, bytes_per_megabit),
-            "pdrPct": pdr_pct(rx, tx), "delayMs": delay_ms(delay_sum, rx),
-            "jitterMs": jitter_sum / jitter_pairs if jitter_pairs else math.nan,
-            "p95Ms": p95,
-            "controlPackets": int(float(flows[0].get("controlPackets", 0) or 0)) if flows else 0,
-            "controlBytes": control_bytes,
-            "controlBytesPerPayloadByte": control_bytes / (rx * payload_size) if rx else math.nan,
-            "meanGeometricDegree": float(flows[0].get("meanGeometricDegree", math.nan)) if flows else math.nan,
-            "maxPackets": int(float(flows[0].get("maxPackets", 0) or 0)) if flows else 0}
-
-
-def _number(value: object) -> bool:
-    try:
-        return math.isfinite(float(value))
-    except (TypeError, ValueError):
-        return False
-
-
-def _read_flow_csv(path: Path) -> list[dict]:
-    with path.open(encoding="utf-8", newline="") as source:
-        reader = csv.DictReader(source)
-        missing = set(FLOW_COLUMNS) - set(reader.fieldnames or [])
-        if missing:
-            raise ValueError(f"Colunas ausentes em {path}: {', '.join(sorted(missing))}")
-        return list(reader)
-
-
-def parse_flowmonitor(path: Path) -> ET.Element:
-    if path.suffix == ".gz":
-        with gzip.open(path, "rb") as source:
-            return ET.parse(source).getroot()
-    return ET.parse(path).getroot()
-
-
-def validate_dataset(root: Path, config: dict, stage: str) -> tuple[pd.DataFrame, dict, list[str]]:
-    manifest_path, config_path = root / "manifest.json", root / "config.json"
-    if not manifest_path.exists() or not config_path.exists():
-        raise ValueError(f"Manifesto/config.json ausente em {root}; diretório de piloto ou etapa incompleta?")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("stage") != stage:
-        raise ValueError(f"Mistura de etapas: solicitado {stage}, manifesto contém {manifest.get('stage')}.")
-    if manifest.get("mode") in ("animation", "single"):
-        raise ValueError("Animações e cenários isolados não são entradas do analisador estatístico.")
-    saved_config = json.loads(config_path.read_text(encoding="utf-8"))
-    config_hash = hashlib.sha256(json.dumps(saved_config, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    if manifest.get("config_sha256") != config_hash:
-        raise ValueError("O hash da configuração no manifesto não confere com config.json.")
-    if saved_config != config:
-        raise ValueError("A configuração da saída difere da configuração atual; não misture estudos.")
-    profile = manifest.get("profile")
-    if not isinstance(profile, dict):
-        raise ValueError("Perfil de execução ausente no manifesto.")
-    if not math.isclose(profile["traffic_stop_s"] - profile["traffic_start_s"],
-                        profile["useful_duration_s"], rel_tol=0, abs_tol=1e-9):
-        raise ValueError("Duração útil inconsistente com os limites de início/fim do tráfego.")
-    if profile != _resolve_profile(config, stage):
-        raise ValueError("Perfil congelado no manifesto diverge do perfil da configuração.")
-    flow_file = root / "flows.csv"
-    if not flow_file.exists():
-        raise ValueError(f"flows.csv não encontrado em {root}; execute/conclua o runner primeiro.")
-    rows = _read_flow_csv(flow_file)
-    if not rows:
-        raise ValueError("flows.csv não contém fluxos para analisar.")
-    frame = pd.DataFrame(rows)
-    frame["run"] = pd.to_numeric(frame["run"], errors="coerce")
-    frame["seed"] = pd.to_numeric(frame["seed"], errors="coerce")
-    frame["speed"] = pd.to_numeric(frame["speed"], errors="coerce")
-    frame["rate"] = pd.to_numeric(frame["rate"], errors="coerce")
-    for column in ("flowId", "txPackets", "rxPackets", "lostPackets", "rxBytes", "flowIndex",
-                   "sourceNode", "destinationNode", "packetSizeBytes", "maxPackets"):
-        if column in frame:
-            frame[column] = pd.to_numeric(frame[column], errors="coerce")
-    if set(frame["stage"].dropna()) != {stage}:
-        raise ValueError("flows.csv contém etapas diferentes ou dados sem etapa identificada.")
-    if set(frame["protocol"].dropna()) != set(config["experiment"]["protocols"]):
-        raise ValueError("flows.csv contém protocolos faltantes ou inesperados.")
-    for column in ("txPackets", "rxPackets", "lostPackets", "rxBytes"):
-        if (frame[column] < 0).any():
-            raise ValueError(f"Dados impossíveis: {column} negativo.")
-    if frame["run"].isna().any() or frame["seed"].isna().any() or frame["speed"].isna().any() or frame["rate"].isna().any():
-        raise ValueError("Há campos de run/seed/velocidade/taxa inválidos.")
-    if (frame["rxPackets"] > frame["txPackets"]).any():
-        raise ValueError("Dados impossíveis: rxPackets maior que txPackets.")
-    if (frame["lostPackets"] > frame["txPackets"]).any():
-        raise ValueError("Dados impossíveis: lostPackets maior que txPackets.")
-    if (frame["txPackets"] <= 0).any():
-        raise ValueError("Divisão por zero: há fluxo sem pacotes transmitidos.")
-    stored_pdr = pd.to_numeric(frame["pdrPct"], errors="coerce")
-    recomputed_pdr = 100.0 * frame["rxPackets"] / frame["txPackets"]
-    if ((recomputed_pdr < 0) | (recomputed_pdr > 100)).any():
-        raise ValueError("Dados impossíveis: PDR fora do intervalo 0–100%.")
-    if not np.allclose(stored_pdr, recomputed_pdr, rtol=1e-8, atol=1e-10):
-        raise ValueError("pdrPct registrado diverge de rxPackets / txPackets × 100.")
-    frame["pdrPct"] = recomputed_pdr
-    stored_throughput = pd.to_numeric(frame["throughputMbps"], errors="coerce")
-    frame["throughputMbps"] = frame["rxBytes"] * 8.0 / profile["useful_duration_s"] / config["metrics"]["bytes_per_megabit"]
-    if not np.allclose(stored_throughput, frame["throughputMbps"], rtol=1e-8, atol=1e-12):
-        raise ValueError("throughputMbps registrado diverge de rxBytes × 8 / duração útil / 10^6.")
-    frame["delayMs"] = pd.to_numeric(frame["delayMs"], errors="coerce")
-    frame["jitterMs"] = pd.to_numeric(frame["jitterMs"], errors="coerce")
-    frame["p95Ms"] = pd.to_numeric(frame["p95Ms"], errors="coerce")
-    frame["delaySumMs"] = pd.to_numeric(frame["delaySumMs"], errors="coerce")
-    frame["jitterSumMs"] = pd.to_numeric(frame["jitterSumMs"], errors="coerce")
-    if frame[["delaySumMs", "jitterSumMs"]].isna().any().any() or (frame[["delaySumMs", "jitterSumMs"]] < 0).any().any():
-        raise ValueError("delaySumMs/jitterSumMs ausente ou negativo.")
-    stored_delay, stored_jitter = frame["delayMs"].copy(), frame["jitterMs"].copy()
-    frame["delayMs"] = np.where(frame["rxPackets"] > 0,
-                                 frame["delaySumMs"] / frame["rxPackets"], np.nan)
-    frame["jitterMs"] = np.where(frame["rxPackets"] > 1,
-                                  frame["jitterSumMs"] / (frame["rxPackets"] - 1), np.nan)
-    if not np.allclose(stored_delay.fillna(0), frame["delayMs"].fillna(0), rtol=1e-6, atol=1e-8):
-        raise ValueError("delayMs registrado diverge de delaySum / rxPackets.")
-    if not np.allclose(stored_jitter.fillna(0), frame["jitterMs"].fillna(0), rtol=1e-6, atol=1e-8):
-        raise ValueError("jitterMs registrado diverge de jitterSum / (rxPackets - 1).")
-    frame.loc[frame["rxPackets"] == 0, ["delayMs", "p95Ms"]] = np.nan
-    frame.loc[frame["rxPackets"] <= 1, "jitterMs"] = np.nan
-    if (frame["delayMs"].dropna() < 0).any() or (frame["jitterMs"].dropna() < 0).any():
-        raise ValueError("Dados impossíveis: atraso ou jitter negativo.")
-    if (frame["p95Ms"].dropna() < 0).any():
-        raise ValueError("Dados impossíveis: p95 de atraso negativo.")
-    if (frame["seed"].astype(int) != int(config["experiment"]["seed_master"])).any():
-        raise ValueError("Seed mestre de uma linha diverge da configuração.")
-    expected_max_packets = np.ceil(frame["rate"] * profile["useful_duration_s"]) + 1
-    if (frame["maxPackets"] != expected_max_packets).any():
-        raise ValueError("MaxPackets não cobre a taxa configurada durante a janela útil.")
-    if (frame["packetSizeBytes"] != profile["packet_size_bytes"]).any():
-        raise ValueError("Tamanho do payload no CSV diverge do perfil.")
-
-    expected_reps = int(manifest["expected_repetitions_per_cell"])
-    validate_analysis_repetitions(expected_reps, manifest.get("mode", ""),
-                                  config["experiment"]["minimum_repetitions"])
-    if manifest.get("mode") == "official" and expected_reps < config["experiment"]["minimum_repetitions"]:
-        raise ValueError("Execução oficial abaixo do mínimo de repetições configurado.")
-    expected_cells = {(protocol, float(speed), int(rate))
-                      for protocol in config["experiment"]["protocols"]
-                      for speed in profile["maximum_speeds_mps"] for rate in profile["rate_pps"]}
-    actual_cells = set(zip(frame["protocol"], frame["speed"], frame["rate"]))
-    if actual_cells != expected_cells:
-        raise ValueError(f"Células da matriz divergentes: faltantes={expected_cells - actual_cells}, extras={actual_cells - expected_cells}.")
-    run_key = ["stage", "protocol", "speed", "rate", "run", "flowIndex"]
-    if frame.duplicated(run_key).any():
-        raise ValueError("flows.csv contém uma linha duplicada para run/fluxo.")
-    warnings = []
-    expected_flow_count = len(profile["flow_pairs"])
-    run_manifests = sorted((root / "runs").glob("*.manifest.json"))
-    expected_manifest_count = len(expected_cells) * expected_reps
-    if len(run_manifests) != expected_manifest_count:
-        raise ValueError(f"Manifestos incompletos: esperado {expected_manifest_count}, encontrado {len(run_manifests)}.")
-    trajectory_hashes: dict[tuple[float, int], set[str]] = {}
-    manifest_keys = set()
-    xml_ids: dict[tuple[str, float, int, int], set[int]] = {}
-    for run_manifest_path in run_manifests:
-        run_manifest = json.loads(run_manifest_path.read_text(encoding="utf-8"))
-        if run_manifest.get("stage") != stage or run_manifest.get("kind") != "metrics":
-            raise ValueError(f"Manifesto de outra etapa/modo: {run_manifest_path}")
-        if run_manifest.get("configuration_sha256") != config_hash:
-            raise ValueError(f"Configuração diferente no manifesto {run_manifest_path}")
-        key = (run_manifest["protocol"], float(run_manifest["speed"]),
-               int(run_manifest["rate"]), int(run_manifest["run"]))
-        if key in manifest_keys:
-            raise ValueError(f"Manifesto duplicado: {key}")
-        manifest_keys.add(key)
-        mobility = root / run_manifest["files"]["mobility"]
-        flow_xml = root / run_manifest["files"]["flowmonitor"]
-        if not mobility.exists() or hashlib.sha256(mobility.read_bytes()).hexdigest() != run_manifest["trajectory_sha256"]:
-            raise ValueError(f"Trace de mobilidade ausente ou hash divergente: {mobility}")
-        if not flow_xml.exists():
-            raise ValueError(f"XML FlowMonitor ausente: {flow_xml}")
-        xml_root = parse_flowmonitor(flow_xml)
-        if xml_root.tag != "FlowMonitor":
-            raise ValueError(f"XML FlowMonitor inválido: {flow_xml}")
-        flow_ids = {int(item.get("flowId")) for item in xml_root.findall("FlowStats/Flow")}
-        flow_rows = frame[(frame["protocol"] == key[0]) & (frame["speed"] == key[1]) &
-                          (frame["rate"] == key[2]) & (frame["run"] == key[3])]
-        csv_ids = set(flow_rows["flowId"].astype(int))
-        if not csv_ids.issubset(flow_ids):
-            raise ValueError(f"FlowMonitor XML não contém todos os flowId do CSV: {flow_xml}")
-        xml_ids[key] = flow_ids
-        if flow_rows["trajectorySha256"].nunique() != 1 or flow_rows["trajectorySha256"].iloc[0] != run_manifest["trajectory_sha256"]:
-            raise ValueError(f"Hash da trajetória diverge no CSV/manifesto: {key}")
-        trajectory_hashes.setdefault((key[1], key[3]), set()).add(run_manifest["trajectory_sha256"])
-    if any(len(values) != 1 for values in trajectory_hashes.values()):
-        raise ValueError("Trajetórias diferentes para a mesma velocidade/run entre protocolos ou cargas.")
-    for cell, group in frame.groupby(["protocol", "speed", "rate"]):
-        runs = sorted(group["run"].astype(int).unique())
-        if len(runs) != expected_reps or runs != list(range(1, expected_reps + 1)):
-            raise ValueError(f"Número de runs incorreto para célula {cell}: esperados {expected_reps}, encontrados {runs}.")
-        for run_id, run_rows in group.groupby("run"):
-            if len(run_rows) != expected_flow_count:
-                raise ValueError(f"Run {run_id} da célula {cell} tem {len(run_rows)} fluxos; esperado {expected_flow_count}.")
-            if set(run_rows["flowIndex"].astype(int)) != set(range(expected_flow_count)):
-                raise ValueError(f"IDs/índices de fluxo incompletos no run {run_id} da célula {cell}.")
-            observed_pairs = {(int(row.flowIndex), int(row.sourceNode), int(row.destinationNode))
-                              for row in run_rows.itertuples()}
-            expected_pairs = {(index, int(pair[0]), int(pair[1]))
-                              for index, pair in enumerate(profile["flow_pairs"])}
-            if observed_pairs != expected_pairs:
-                raise ValueError(f"Pares origem-destino divergentes no run {run_id} da célula {cell}.")
-    no_receive = int((frame["rxPackets"] == 0).sum())
-    if no_receive:
-        warnings.append(f"{no_receive} fluxo(s) sem recepção: PDR=0 quando transmitidos; atraso/jitter ficam ausentes.")
-    if frame["jitterMs"].isna().any():
-        warnings.append(f"{int(frame['jitterMs'].isna().sum())} fluxo(s) com jitter ausente (menos de 2 pacotes recebidos).")
-    return frame, manifest, warnings
-
-
-def _resolve_profile(config: dict, stage: str) -> dict:
-    profile = dict(config["profiles"][stage])
-    if "base_profile" in profile:
-        base = dict(config["profiles"][profile.pop("base_profile")])
-        base.pop("animation", None)
-        base.update(profile)
-        return base
-    return profile
+    delay_sum = sum(float(flow["delaySumMs"] or 0) for flow in flows)
+    jitter_sum = sum(float(flow["jitterSumMs"] or 0) for flow in flows)
+    jitter_samples = sum(max(int(flow["rxPackets"]) - 1, 0) for flow in flows)
+    return {
+        "txPackets": tx,
+        "rxPackets": rx,
+        "lostPackets": lost,
+        "rxBytes": rx_bytes,
+        "throughputMbps": throughput_mbps(rx_bytes, useful_duration_s, bytes_per_megabit),
+        "pdrPct": pdr_pct(rx, tx),
+        "delayMs": delay_ms(delay_sum, rx),
+        "jitterMs": jitter_sum / jitter_samples if jitter_samples else math.nan,
+    }
 
 
 def mean_ci(series: pd.Series, confidence: float) -> tuple[int, float, float, float, float]:
@@ -319,80 +85,214 @@ def mean_ci(series: pd.Series, confidence: float) -> tuple[int, float, float, fl
     return n, mean, std, mean - half, mean + half
 
 
-def holm_adjust(p_values: list[float]) -> list[float]:
-    order = np.argsort(p_values)
-    adjusted = [1.0] * len(p_values)
-    running = 0.0
-    for rank, index in enumerate(order):
-        running = max(running, min(1.0, (len(p_values) - rank) * p_values[index]))
-        adjusted[index] = running
-    return adjusted
+def validate_analysis_repetitions(repetitions: int) -> None:
+    if repetitions < 2:
+        raise ValueError("A análise exige pelo menos 2 runs por célula.")
 
 
-def build_run_results(frame: pd.DataFrame, profile: dict, config: dict) -> pd.DataFrame:
-    results = []
-    for key, group in frame.groupby(["stage", "protocol", "speed", "rate", "run", "seed"], sort=True):
-        records = group.to_dict("records")
-        aggregate = aggregate_flows(records, profile["useful_duration_s"],
-                        config["metrics"]["bytes_per_megabit"])
-        aggregate["stage"], aggregate["protocol"], aggregate["speed"], aggregate["rate"], aggregate["run"], aggregate["seed"] = key
-        aggregate["flowCount"] = len(group)
-        aggregate["trajectoryHash"] = str(group["trajectorySha256"].iloc[0])
-        aggregate["controlPacketsPerDeliveredPacket"] = aggregate["controlPackets"] / aggregate["rxPackets"] if aggregate["rxPackets"] else math.nan
-        results.append(aggregate)
-    return pd.DataFrame(results)
+def resolve_profile(config: dict, stage: str) -> dict:
+    profile = dict(config["profiles"][stage])
+    if "base_profile" in profile:
+        base = dict(config["profiles"][profile.pop("base_profile")])
+        base.pop("animation", None)
+        base.update(profile)
+        return base
+    return profile
+
+
+def _read_flows(path: Path) -> list[dict]:
+    with path.open(encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        missing = set(FLOW_COLUMNS) - set(reader.fieldnames or [])
+        if missing:
+            raise ValueError(f"Colunas ausentes em {path}: {', '.join(sorted(missing))}")
+        return list(reader)
+
+
+def _as_float(value: object) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return math.nan
+
+
+def _close_or_missing(stored: object, calculated: float, label: str) -> None:
+    observed = _as_float(stored)
+    if math.isnan(calculated):
+        if not math.isnan(observed):
+            raise ValueError(f"{label}: deveria estar ausente, mas contém {stored}.")
+    elif not math.isfinite(observed) or not math.isclose(observed, calculated, rel_tol=1e-7, abs_tol=1e-9):
+        raise ValueError(f"{label}: valor registrado diverge do cálculo ({stored} != {calculated}).")
+
+
+def validate_dataset(root: Path, config: dict, stage: str) -> tuple[pd.DataFrame, dict, list[str]]:
+    manifest_path, config_path, flow_path = root / "manifest.json", root / "config.json", root / "flows.csv"
+    if not manifest_path.exists() or not config_path.exists() or not flow_path.exists():
+        raise ValueError(f"Manifesto, config.json ou flows.csv ausente em {root}.")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("stage") != stage:
+        raise ValueError(f"Etapa divergente: solicitada {stage}, manifesto contém {manifest.get('stage')}.")
+    if manifest.get("mode") in ("animation", "single"):
+        raise ValueError("Animações e execuções isoladas não podem ser analisadas como lote.")
+    saved_config = json.loads(config_path.read_text(encoding="utf-8"))
+    config_hash = hashlib.sha256(json.dumps(saved_config, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    if manifest.get("config_sha256") != config_hash or saved_config != config:
+        raise ValueError("Configuração da saída difere da configuração atual ou do manifesto.")
+    profile = manifest.get("profile")
+    if not isinstance(profile, dict) or profile != resolve_profile(config, stage):
+        raise ValueError("Perfil congelado no manifesto diverge da configuração.")
+    if not math.isclose(profile["traffic_stop_s"] - profile["traffic_start_s"],
+                        profile["useful_duration_s"], rel_tol=0, abs_tol=1e-9):
+        raise ValueError("Duração útil inconsistente com a janela de tráfego.")
+
+    records = _read_flows(flow_path)
+    if not records:
+        raise ValueError("flows.csv está vazio.")
+    frame = pd.DataFrame(records)
+    numeric = ["speed", "rate", "run", "seed", "flowId", "txPackets", "rxPackets", "lostPackets",
+               "rxBytes", "maxPackets", "flowIndex", "sourceNode", "destinationNode", "packetSizeBytes"]
+    for column in numeric:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        if frame[column].isna().any():
+            raise ValueError(f"Campo numérico inválido ou ausente: {column}.")
+    for column in ("delaySumMs", "jitterSumMs"):
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        if frame[column].isna().any() or (frame[column] < 0).any():
+            raise ValueError(f"{column} ausente ou negativo.")
+    if set(frame["stage"]) != {stage}:
+        raise ValueError("flows.csv mistura etapas ou contém etapa ausente.")
+    if set(frame["protocol"]) != set(config["experiment"]["protocols"]):
+        raise ValueError("flows.csv contém protocolos faltantes ou inesperados.")
+    if (frame[["txPackets", "rxPackets", "lostPackets", "rxBytes"]] < 0).any().any():
+        raise ValueError("Contagem de pacotes/bytes negativa.")
+    if (frame["rxPackets"] > frame["txPackets"]).any() or (frame["lostPackets"] > frame["txPackets"]).any():
+        raise ValueError("Contagens impossíveis: rx ou lost maior que tx.")
+    if (frame["seed"].astype(int) != int(config["experiment"]["seed_master"])).any():
+        raise ValueError("Seed mestre de uma linha diverge da configuração.")
+    if (frame["packetSizeBytes"] != int(profile["packet_size_bytes"])).any():
+        raise ValueError("Tamanho do payload diverge do perfil.")
+    expected_max = np.ceil(frame["rate"] * profile["useful_duration_s"]) + 1
+    if (frame["maxPackets"] != expected_max).any():
+        raise ValueError("MaxPackets não cobre a taxa durante a janela útil.")
+
+    for raw, row in zip(records, frame.itertuples(index=False)):
+        expected = {
+            "throughputMbps": throughput_mbps(int(row.rxBytes), profile["useful_duration_s"],
+                                               config["metrics"]["bytes_per_megabit"]),
+            "pdrPct": pdr_pct(int(row.rxPackets), int(row.txPackets)),
+            "delayMs": delay_ms(float(row.delaySumMs), int(row.rxPackets)),
+            "jitterMs": jitter_ms(float(row.jitterSumMs), int(row.rxPackets)),
+        }
+        for metric, value in expected.items():
+            _close_or_missing(raw[metric], value, f"{metric}, {row.protocol}/{row.speed}/{row.rate}/run{row.run}")
+
+    expected_reps = int(manifest["expected_repetitions_per_cell"])
+    validate_analysis_repetitions(expected_reps)
+    if manifest.get("mode") == "official" and expected_reps < int(config["experiment"]["minimum_repetitions"]):
+        raise ValueError("Execução oficial abaixo do mínimo de repetições.")
+    expected_cells = {(protocol, float(speed), int(rate))
+                      for protocol in config["experiment"]["protocols"]
+                      for speed in profile["maximum_speeds_mps"] for rate in profile["rate_pps"]}
+    actual_cells = set(zip(frame["protocol"], frame["speed"], frame["rate"].astype(int)))
+    if actual_cells != expected_cells:
+        raise ValueError("Células da matriz ausentes ou inesperadas.")
+    key_columns = ["stage", "protocol", "speed", "rate", "run", "flowIndex"]
+    if frame.duplicated(key_columns).any():
+        raise ValueError("flows.csv contém linhas duplicadas para run/fluxo.")
+
+    expected_flow_count = len(profile["flow_pairs"])
+    manifests = sorted((root / "runs").glob("*.manifest.json"))
+    if len(manifests) != len(expected_cells) * expected_reps:
+        raise ValueError(f"Manifestos incompletos: esperado {len(expected_cells) * expected_reps}, encontrado {len(manifests)}.")
+    trajectory_hashes: dict[tuple[float, int], set[str]] = {}
+    manifest_keys = set()
+    warnings = []
+    for path in manifests:
+        item = json.loads(path.read_text(encoding="utf-8"))
+        if item.get("stage") != stage or item.get("kind") != "metrics":
+            raise ValueError(f"Manifesto de outra etapa/modo: {path}.")
+        if item.get("configuration_sha256") != config_hash:
+            raise ValueError(f"Hash da configuração divergente em {path}.")
+        key = (item["protocol"], float(item["speed"]), int(item["rate"]), int(item["run"]))
+        if key in manifest_keys:
+            raise ValueError(f"Manifesto duplicado: {key}.")
+        manifest_keys.add(key)
+        mobility = root / item["files"]["mobility"]
+        flow_xml = root / item["files"]["flowmonitor"]
+        if not mobility.exists() or hashlib.sha256(mobility.read_bytes()).hexdigest() != item["trajectory_sha256"]:
+            raise ValueError(f"Trace de mobilidade ausente ou hash divergente: {mobility}.")
+        if not flow_xml.exists():
+            raise ValueError(f"XML FlowMonitor ausente: {flow_xml}.")
+        selection = frame[(frame["protocol"] == key[0]) & (frame["speed"] == key[1]) &
+                          (frame["rate"] == key[2]) & (frame["run"] == key[3])]
+        if len(selection) != expected_flow_count or selection["trajectorySha256"].nunique() != 1:
+            raise ValueError(f"Fluxos/hashes incompletos no manifesto {key}.")
+        if selection["trajectorySha256"].iloc[0] != item["trajectory_sha256"]:
+            raise ValueError(f"Hash da trajetória diverge entre CSV e manifesto: {key}.")
+        trajectory_hashes.setdefault((key[1], key[3]), set()).add(item["trajectory_sha256"])
+    if any(len(values) != 1 for values in trajectory_hashes.values()):
+        raise ValueError("Trajetórias diferentes entre protocolos ou cargas para mesma velocidade/run.")
+
+    for cell, group in frame.groupby(["protocol", "speed", "rate"]):
+        runs = sorted(group["run"].astype(int).unique())
+        if runs != list(range(1, expected_reps + 1)):
+            raise ValueError(f"Célula {cell} tem runs faltantes ou inesperados: {runs}.")
+        for run, run_rows in group.groupby("run"):
+            if len(run_rows) != expected_flow_count:
+                raise ValueError(f"Célula {cell}, run {run}: esperado {expected_flow_count} fluxos.")
+            observed_pairs = {(int(row.flowIndex), int(row.sourceNode), int(row.destinationNode))
+                              for row in run_rows.itertuples()}
+            wanted_pairs = {(i, int(pair[0]), int(pair[1])) for i, pair in enumerate(profile["flow_pairs"])}
+            if observed_pairs != wanted_pairs:
+                raise ValueError(f"Pares origem/destino inesperados na célula {cell}, run {run}.")
+    no_receive = int((frame["rxPackets"] == 0).sum())
+    if no_receive:
+        warnings.append(f"{no_receive} fluxo(s) sem recepção: PDR=0; atraso/jitter ausentes.")
+    if frame["jitterMs"].isna().any():
+        warnings.append(f"{int(frame['jitterMs'].isna().sum())} fluxo(s) com jitter ausente (menos de 2 recepções).")
+    return frame, manifest, warnings
 
 
 def summarize(results: pd.DataFrame, confidence: float) -> pd.DataFrame:
-    metrics = ["txPackets", "rxPackets", "lostPackets", "rxBytes", "throughputMbps",
-               "pdrPct", "delayMs", "jitterMs", "p95Ms", "controlPackets", "controlBytes",
-               "controlBytesPerPayloadByte", "meanGeometricDegree"]
     rows = []
     for (stage, protocol, speed, rate), group in results.groupby(["stage", "protocol", "speed", "rate"]):
-        for metric in metrics:
-            n, mean, std, lower, upper = mean_ci(group[metric], confidence)
+        for metric in METRICS:
+            n, mean, std, low, high = mean_ci(group[metric], confidence)
             rows.append({"stage": stage, "protocol": protocol, "speed": speed, "rate": rate,
                          "metric": metric, "n_runs": len(group), "n_valid": n,
-                         "mean": mean, "std": std, "ci95_low": lower, "ci95_high": upper})
+                         "mean": mean, "std": std, "ci95_low": low, "ci95_high": high})
     return pd.DataFrame(rows)
 
 
-def paired_comparisons(results: pd.DataFrame, config: dict, threshold: int) -> pd.DataFrame:
+def classify_h1(summary: pd.DataFrame, stage: str) -> pd.DataFrame:
     rows = []
-    metric_names = ["pdrPct", "throughputMbps", "delayMs", "jitterMs", "p95Ms",
-                    "controlPackets", "controlBytes", "controlBytesPerPayloadByte"]
-    protocols = config["experiment"]["protocols"]
-    for (stage, speed, rate), group in results.groupby(["stage", "speed", "rate"]):
-        for metric in metric_names:
-            for i, left in enumerate(protocols):
-                for right in protocols[i + 1:]:
-                    paired = group[group["protocol"].isin((left, right))].pivot(
-                        index="run", columns="protocol", values=metric).dropna(subset=[left, right])
-                    n = len(paired)
-                    pvalue = math.nan
-                    if n >= threshold:
-                        differences = paired[left].to_numpy() - paired[right].to_numpy()
-                        if np.allclose(differences, 0):
-                            pvalue = 1.0
-                        else:
-                            pvalue = float(stats.ttest_rel(paired[left], paired[right]).pvalue)
-                    rows.append({"stage": stage, "speed": speed, "rate": rate, "metric": metric,
-                                 "protocolA": left, "protocolB": right, "n_paired": n,
-                                 "test": "paired-t" if n >= threshold else "IC-only-small-n",
-                                 "p_value": pvalue, "p_holm": math.nan})
-    frame = pd.DataFrame(rows)
-    for _, indices in frame[frame["p_value"].notna()].groupby(["stage", "speed", "rate", "metric"]).groups.items():
-        frame.loc[indices, "p_holm"] = holm_adjust(frame.loc[indices, "p_value"].tolist())
-    frame["p_holm_hypothesis"] = math.nan
-    hypothesis_families = {
-        "H2": ["pdrPct", "throughputMbps", "delayMs"],
-        "H3": ["controlPackets", "controlBytes", "controlBytesPerPayloadByte"],
-    }
-    for metric_names in hypothesis_families.values():
-        selected = frame["metric"].isin(metric_names) & frame["p_value"].notna()
-        if selected.any():
-            frame.loc[selected, "p_holm_hypothesis"] = holm_adjust(frame.loc[selected, "p_value"].tolist())
-    return frame
+    selected = summary[summary["stage"] == stage]
+    for (protocol, rate, metric), group in selected.groupby(["protocol", "rate", "metric"]):
+        endpoints = {float(row.speed): row for row in group.itertuples()}
+        if 1.0 not in endpoints or 20.0 not in endpoints:
+            continue
+        low_speed, high_speed = endpoints[1.0], endpoints[20.0]
+        outcome = "inconclusiva"
+        direction = METRICS[metric][1]
+        if all(math.isfinite(value) for value in (low_speed.ci95_low, low_speed.ci95_high,
+                                                   high_speed.ci95_low, high_speed.ci95_high)):
+            if direction == "higher":
+                if high_speed.ci95_high < low_speed.ci95_low:
+                    outcome = "sustentada"
+                elif low_speed.ci95_high < high_speed.ci95_low:
+                    outcome = "melhora"
+            else:
+                if high_speed.ci95_low > low_speed.ci95_high:
+                    outcome = "sustentada"
+                elif high_speed.ci95_high < low_speed.ci95_low:
+                    outcome = "melhora"
+        rows.append({"stage": stage, "protocol": protocol, "rate": rate, "metric": metric,
+                     "n_1mps": low_speed.n_valid, "mean_1mps": low_speed.mean,
+                     "ci95_low_1mps": low_speed.ci95_low, "ci95_high_1mps": low_speed.ci95_high,
+                     "n_20mps": high_speed.n_valid, "mean_20mps": high_speed.mean,
+                     "ci95_low_20mps": high_speed.ci95_low, "ci95_high_20mps": high_speed.ci95_high,
+                     "outcome": outcome})
+    return pd.DataFrame(rows)
 
 
 def save_csv(frame: pd.DataFrame, path: Path) -> None:
@@ -400,159 +300,85 @@ def save_csv(frame: pd.DataFrame, path: Path) -> None:
     frame.to_csv(path, index=False, na_rep="")
 
 
-def plot_metric(summary: pd.DataFrame, metric: str, ylabel: str, stage: str,
-                figure_root: Path, confidence: float, rates: list[int],
-                minimum_pdr_pct: float) -> list[Path]:
-    outputs = []
-    rate_groups = rates if len(rates) > 1 else [None]
-    for rate in rate_groups:
+def write_h1_report(h1: pd.DataFrame, path: Path) -> None:
+    lines = ["# Síntese da hipótese H1", "",
+             "Critério: comparação dos ICs t de 95% entre 1 e 20 m/s. "
+             "Não sobreposição na direção de piora = sustentada; na direção oposta = melhora; "
+             "sobreposição ou IC indisponível = inconclusiva.", "",
+             "| Protocolo | Carga (pps/fluxo) | Métrica | Desfecho |", "|---|---:|---|---|"]
+    for row in h1.itertuples(index=False):
+        label = METRICS[row.metric][0]
+        lines.append(f"| {row.protocol.upper()} | {row.rate} | {label} | {row.outcome} |")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def plot_metrics(summary: pd.DataFrame, stage: str, figure_root: Path) -> list[Path]:
+    output = []
+    for metric, (label, _) in METRICS.items():
         fig, ax = plt.subplots(figsize=(8, 5))
         selected = summary[(summary["stage"] == stage) & (summary["metric"] == metric)]
-        if rate is not None:
-            selected = selected[selected["rate"] == rate]
-        for protocol, values in selected.groupby("protocol"):
-            values = values.sort_values("speed")
-            n = values["n_valid"].to_numpy(dtype=int)
-            errors = np.array([(row["ci95_high"] - row["mean"] if pd.notna(row["ci95_high"]) else np.nan)
-                               for _, row in values.iterrows()])
-            ax.errorbar(values["speed"], values["mean"], yerr=errors, marker="o", capsize=4,
-                        linewidth=1.8, label=protocol.upper())
-        if metric == "pdrPct":
-            ax.axhline(minimum_pdr_pct, color="gray", linestyle="--",
-                       label=f"limiar prévio {minimum_pdr_pct:g}%")
-        xlabel = "Velocidade máxima (m/s)"
-        title = f"{metric} × velocidade — {stage}"
-        filename = f"{metric}-speed.png"
-        if rate is not None:
-            title += f" — {rate} pacotes/s por fluxo"
-            filename = f"{metric}-rate-{rate}pps.png"
-        ax.set(xlabel=xlabel, ylabel=ylabel, title=title)
-        ax.grid(True, alpha=0.25)
-        ax.legend(title="Protocolo")
-        fig.tight_layout()
-        path = figure_root / stage / filename
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(path, dpi=160)
-        plt.close(fig)
-        outputs.append(path)
-    return outputs
-
-
-def plot_overhead_pdr(results: pd.DataFrame, stage: str, figure_root: Path,
-                     rates: list[int]) -> list[Path]:
-    outputs = []
-    plotted_rates = rates if len(rates) > 1 else [None]
-    for rate in plotted_rates:
-        selected = results[results["stage"] == stage]
-        if rate is not None:
-            selected = selected[selected["rate"] == rate]
-        fig, ax = plt.subplots(figsize=(8, 5))
-        for protocol, values in selected.groupby("protocol"):
-            ax.scatter(values["pdrPct"], values["controlBytesPerPayloadByte"],
-                       label=protocol.upper(), alpha=0.75)
-        filename = "overhead-pdr.png" if rate is None else f"overhead-pdr-rate-{rate}pps.png"
-        title = f"Overhead de controle × PDR — {stage}"
-        if rate is not None:
-            title += f" — {rate} pacotes/s por fluxo"
-        ax.set(xlabel="PDR (%)", ylabel="Bytes de controle / byte de payload", title=title)
-        ax.grid(True, alpha=0.25)
-        ax.legend(title="Protocolo")
-        fig.tight_layout()
-        path = figure_root / stage / filename
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(path, dpi=160)
-        plt.close(fig)
-        outputs.append(path)
-    return outputs
-
-
-def print_synthesis(summary: pd.DataFrame, stage: str, protocols: list[str], rates: list[int]) -> None:
-    print(f"\nSíntese descritiva — {stage} (limitada às condições simuladas):")
-    labels = {"pdrPct": "PDR (%)", "throughputMbps": "Throughput (Mbps)",
-              "delayMs": "Atraso (ms)", "jitterMs": "Jitter (ms)"}
-    for rate in rates:
-        print(f"Carga: {rate} pacotes/s por fluxo")
-        for metric, label in labels.items():
-            selected = summary[(summary["stage"] == stage) & (summary["rate"] == rate) &
-                               (summary["metric"] == metric)]
-            descriptions = []
-            for protocol in protocols:
-                values = selected[selected["protocol"] == protocol].sort_values("speed")
-                if values.empty:
-                    continue
-                means = values["mean"].to_numpy(dtype=float)
-                valid = np.isfinite(means)
-                trend = "sem valores válidos"
-                if valid.sum() >= 2:
-                    slope = float(np.polyfit(values.loc[valid, "speed"], means[valid], 1)[0])
-                    trend = "tendência crescente" if slope > 0 else ("tendência decrescente" if slope < 0 else "sem tendência linear")
-                degradation_index = int(np.nanargmax(means) if metric in ("delayMs", "jitterMs") else np.nanargmin(means)) if valid.any() else -1
-                degradation = f"maior degradação observada em {values.iloc[degradation_index]['speed']:g} m/s" if degradation_index >= 0 else "ponto de degradação não identificável"
-                valid_ns = values.loc[valid, "n_valid"].astype(int).tolist()
-                n_text = f"n válido={min(valid_ns)}–{max(valid_ns)}" if valid_ns else "n válido=0"
-                descriptions.append(f"{protocol.upper()}: {trend}; {degradation}; {n_text}")
-            overlaps = []
-            for i, left in enumerate(protocols):
-                for right in protocols[i + 1:]:
-                    a = selected[selected["protocol"] == left].set_index("speed")
-                    b = selected[selected["protocol"] == right].set_index("speed")
-                    shared = sorted(set(a.index) & set(b.index))
-                    overlap_speeds = [speed for speed in shared
-                        if pd.notna(a.loc[speed, "ci95_low"]) and pd.notna(b.loc[speed, "ci95_low"])
-                        and a.loc[speed, "ci95_low"] <= b.loc[speed, "ci95_high"]
-                        and b.loc[speed, "ci95_low"] <= a.loc[speed, "ci95_high"]]
-                    overlaps.append(f"{left.upper()}/{right.upper()}: ICs sobrepostos em {len(overlap_speeds)}/{len(shared)} velocidades")
-            print(f"- {label}: " + "; ".join(descriptions) + ". " + "; ".join(overlaps) + ".")
-    print("Síntese descritiva não substitui inferência: diferenças são inconclusivas quando ICs se sobrepõem ou n válido é pequeno.")
-
-
-def print_hypothesis_summary(results: pd.DataFrame, paired: pd.DataFrame, config: dict) -> None:
-    alpha = config["experiment"]["significance_level"]
-    threshold = config["experiment"]["large_n_threshold"]
-    protocols = config["experiment"]["protocols"]
-    h1_rows = []
-    for (stage, protocol, rate), group in results.groupby(["stage", "protocol", "rate"]):
-        speeds = sorted(group["speed"].unique())
-        if len(speeds) < 2:
-            continue
-        low = group[group["speed"] == speeds[0]].set_index("run")
-        high = group[group["speed"] == speeds[-1]].set_index("run")
-        joined = low.join(high, lsuffix="_low", rsuffix="_high", how="inner")
-        for metric in ("delayMs", "pdrPct"):
-            delta_series = (joined[f"{metric}_high"] - joined[f"{metric}_low"]).dropna()
-            delta = delta_series.to_numpy(dtype=float)
-            n = len(delta_series)
-            if n < 2:
+        for (protocol, rate), series in selected.groupby(["protocol", "rate"]):
+            series = series.sort_values("speed")
+            valid = np.isfinite(series["mean"].to_numpy(dtype=float))
+            series = series.loc[valid]
+            if series.empty:
                 continue
-            mean = float(np.mean(delta))
-            half = float(stats.t.ppf((1 + config["experiment"]["confidence_level"]) / 2,
-                                     n - 1) * stats.sem(delta))
-            pvalue = (float(stats.ttest_rel(joined.loc[delta_series.index, f"{metric}_high"],
-                                           joined.loc[delta_series.index, f"{metric}_low"]).pvalue)
-                      if n >= threshold else math.nan)
-            h1_rows.append({"stage": stage, "protocol": protocol, "rate": rate, "metric": metric,
-                            "mean_delta": mean, "ci_low": mean - half, "ci_high": mean + half,
-                            "n": n, "p": pvalue})
-    for metric in ("delayMs", "pdrPct"):
-        selected = [item for item in h1_rows if item["metric"] == metric and math.isfinite(item["p"])]
-        adjusted = holm_adjust([item["p"] for item in selected])
-        for item, value in zip(selected, adjusted):
-            item["p_holm"] = value
-    h1_supported = [item for item in h1_rows if item.get("p_holm", 1) < alpha and
-                    ((item["metric"] == "delayMs" and item["ci_low"] > 0) or
-                     (item["metric"] == "pdrPct" and item["ci_high"] < 0))]
-    print("\nHipóteses (síntese neutra):")
-    print("- H1, mobilidade: " + (f"IC/teste pareado indica aumento de atraso e/ou queda de PDR em {len(h1_supported)} comparação(ões), com t pareado e Holm quando n ≥ {threshold}."
-                                  if h1_supported else "inconclusiva: os ICs/testes de velocidade não sustentam uma direção após o critério configurado."))
-    h2 = paired[paired["metric"].isin(["pdrPct", "throughputMbps", "delayMs"])]
-    h2 = h2[h2["p_holm_hypothesis"].notna() & (h2["p_holm_hypothesis"] < alpha)]
-    print("- H2, protocolos: " + (f"diferenças detectadas em {len(h2)} comparação(ões) pareadas de atraso, throughput ou PDR."
-                                  if len(h2) else "inconclusiva: nenhuma diferença pareada atingiu o nível ajustado."))
-    h3 = paired[paired["metric"].isin(["controlPackets", "controlBytes", "controlBytesPerPayloadByte"])]
-    h3 = h3[h3["p_holm_hypothesis"].notna() & (h3["p_holm_hypothesis"] < alpha)]
-    print("- H3, overhead: " + (f"diferenças detectadas em {len(h3)} comparação(ões) pareadas de controle."
-                                 if len(h3) else "inconclusiva: nenhuma diferença pareada de overhead atingiu o nível ajustado."))
-    print("Conclusões limitadas às condições simuladas; nenhum protocolo é declarado globalmente superior.")
+            lower = np.maximum(0, series["mean"].to_numpy() - series["ci95_low"].to_numpy())
+            upper = np.maximum(0, series["ci95_high"].to_numpy() - series["mean"].to_numpy())
+            errors = np.vstack([np.nan_to_num(lower), np.nan_to_num(upper)])
+            suffix = f", {int(rate)} pps" if selected["rate"].nunique() > 1 else ""
+            ax.errorbar(series["speed"], series["mean"], yerr=errors, marker="o", capsize=4,
+                        linewidth=1.6, label=f"{protocol.upper()}{suffix}")
+        ax.set(xlabel="Velocidade máxima (m/s)", ylabel=label,
+               title=f"{label} × velocidade — {stage}")
+        ax.grid(True, alpha=0.25)
+        ax.legend(title="Protocolo / carga")
+        fig.tight_layout()
+        path = figure_root / stage / f"{metric}-speed.png"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(path, dpi=160)
+        plt.close(fig)
+        output.append(path)
+    return output
+
+
+def write_saturation_check(results: pd.DataFrame, profile: dict, stage: str, mode: str,
+                           path: Path) -> None:
+    if stage != "stage2" or 100 not in set(results["rate"]):
+        return
+    flow_count = len(profile["flow_pairs"])
+    payload_mbps = flow_count * 100 * int(profile["packet_size_bytes"]) * 8 / 1e6
+    ip_udp_mbps = flow_count * 100 * (int(profile["packet_size_bytes"]) + 28) * 8 / 1e6
+    lines = ["# Checagem de carga a 100 pacotes/s por fluxo", "",
+             f"Carga oferecida: **{payload_mbps:.4f} Mbps de payload**; considerando cabeçalhos IPv4/UDP, "
+             f"aproximadamente **{ip_udp_mbps:.4f} Mbps**. O modo PHY configurado é 6 Mbps.",
+             "A razão entre carga IP/UDP e taxa PHY é apenas uma referência: não mede airtime e não inclui "
+             "preambulos, contenção, retransmissões nem tráfego de roteamento. Saturação não pode ser confirmada "
+             "somente por essa razão.", "",
+             "Comparação descritiva das médias agregadas entre runs:",
+             "", "| Protocolo | PDR médio a 10 pps | PDR médio a 100 pps | Atraso médio a 10 pps (ms) | "
+             "Atraso médio a 100 pps (ms) | Velocidades com PDR menor e atraso maior a 100 pps |",
+             "|---|---:|---:|---:|---:|---:|"]
+    for protocol in sorted(results["protocol"].unique()):
+        subset = results[results["protocol"] == protocol]
+        at10, at100 = subset[subset["rate"] == 10], subset[subset["rate"] == 100]
+        pdr10, pdr100 = at10["pdrPct"].mean(), at100["pdrPct"].mean()
+        delay10, delay100 = at10["delayMs"].mean(), at100["delayMs"].mean()
+        comparisons = at10.groupby("speed")["pdrPct"].mean().to_frame("pdr10").join(
+            at100.groupby("speed")["pdrPct"].mean().rename("pdr100")).join(
+            at10.groupby("speed")["delayMs"].mean().rename("delay10")).join(
+            at100.groupby("speed")["delayMs"].mean().rename("delay100"))
+        signs = int(((comparisons["pdr100"] < comparisons["pdr10"]) &
+                     (comparisons["delay100"] > comparisons["delay10"])).sum())
+        def fmt(value: float) -> str:
+            return f"{value:.3f}" if math.isfinite(value) else "ausente"
+        lines.append(f"| {protocol.upper()} | {fmt(pdr10)}% | {fmt(pdr100)}% | {fmt(delay10)} | "
+                     f"{fmt(delay100)} | {signs}/{len(comparisons)} |")
+    lines += ["", "Interpretação: a contagem final indica em quantas velocidades os dois sinais de degradação "
+              "(PDR menor e atraso maior) aparecem juntos. É uma checagem empírica de indícios de contenção, "
+              f"não uma medição direta de saturação. Modo da amostra: **{mode}**; resultados de piloto são preliminares."]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def analyze(input_root: Path, stage: str, config: dict, output_root: Path | None = None,
@@ -566,40 +392,39 @@ def analyze(input_root: Path, stage: str, config: dict, output_root: Path | None
         figure_root = (EXPERIMENT_DIR / "figures" if manifest.get("mode") == "official"
                        else input_root / "figures")
     output_root.mkdir(parents=True, exist_ok=True)
-    flows_out = flows.copy()
-    flows_out["throughputMbps"] = flows_out["rxBytes"] * 8.0 / profile["useful_duration_s"] / config["metrics"]["bytes_per_megabit"]
-    for column in ("pdrPct", "throughputMbps", "delayMs", "jitterMs", "p95Ms"):
-        flows_out[column] = pd.to_numeric(flows_out[column], errors="coerce")
-    save_csv(flows_out, output_root / "flows.csv")
-    results = build_run_results(flows_out, profile, config)
-    save_csv(results, output_root / "results.csv")
-    summary = summarize(results, config["experiment"]["confidence_level"])
+    results = []
+    for key, group in flows.groupby(["stage", "protocol", "speed", "rate", "run", "seed"], sort=True):
+        row = aggregate_flows(group.to_dict("records"), profile["useful_duration_s"],
+                              config["metrics"]["bytes_per_megabit"])
+        row.update(dict(zip(["stage", "protocol", "speed", "rate", "run", "seed"], key)))
+        row["flowCount"] = len(group)
+        row["trajectoryHash"] = group["trajectorySha256"].iloc[0]
+        results.append(row)
+    results_frame = pd.DataFrame(results)
+    summary = summarize(results_frame, config["experiment"]["confidence_level"])
+    h1 = classify_h1(summary, stage)
+    save_csv(flows, output_root / "flows.csv")
+    save_csv(results_frame, output_root / "results.csv")
     save_csv(summary, output_root / "summary.csv")
-    paired = paired_comparisons(results, config, config["experiment"]["large_n_threshold"])
-    save_csv(paired, output_root / "paired-tests.csv")
-    mandatory = [
-        ("pdrPct", "PDR (%)"), ("throughputMbps", "Throughput (Mbps)"),
-        ("delayMs", "Atraso (ms)"), ("jitterMs", "Jitter (ms)")]
-    figures = []
-    rates = sorted(int(rate) for rate in profile["rate_pps"])
-    for metric, label in mandatory:
-        figures.extend(plot_metric(summary, metric, label, stage, figure_root,
-                                   config["experiment"]["confidence_level"], rates,
-                                   config["experiment"]["minimum_reliable_pdr_pct"]))
-    figures.extend(plot_overhead_pdr(results, stage, figure_root, rates))
-    print(f"Análise {stage}: {len(results)} execuções; {len(flows_out)} fluxos; saídas {output_root}")
+    save_csv(h1, output_root / "h1-results.csv")
+    write_h1_report(h1, output_root / "h1-summary.md")
+    figures = plot_metrics(summary, stage, figure_root)
+    write_saturation_check(results_frame, profile, stage, manifest.get("mode", "unknown"),
+                           output_root / "saturation-check.md")
+    print(f"Análise {stage}: {len(results_frame)} execuções; {len(flows)} fluxos; saídas {output_root}")
     for warning in warnings:
         print(f"Aviso: {warning}", file=sys.stderr)
     for path in figures:
         print(f"Figura: {path}")
-    print_synthesis(summary, stage, config["experiment"]["protocols"], rates)
-    print_hypothesis_summary(results, paired, config)
-    return output_root, figure_root, results
+    print(f"Síntese H1: {output_root / 'h1-summary.md'}")
+    if stage == "stage2":
+        print(f"Checagem de carga/saturação: {output_root / 'saturation-check.md'}")
+    return output_root, figure_root, results_frame
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--stage", choices=("stage1", "stage2", "stage3"), default="stage1")
+    parser.add_argument("--stage", choices=("stage1", "stage2"), default="stage1")
     parser.add_argument("--config", type=Path, default=ROOT / "config" / "experiment.json")
     parser.add_argument("--input", type=Path, help="Diretório raw da etapa ou do piloto")
     parser.add_argument("--output", type=Path, help="Destino CSV processado")
@@ -616,6 +441,6 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (OSError, ValueError, KeyError, json.JSONDecodeError, ET.ParseError) as error:
+    except (OSError, ValueError, KeyError, json.JSONDecodeError) as error:
         print(f"Erro: {error}", file=sys.stderr)
         raise SystemExit(2)
