@@ -208,6 +208,19 @@ def run_stage(root: Path) -> str:
     return "stage1"
 
 
+def discard_partial(root: Path, tag: str) -> None:
+    """Remove artefatos de uma execução sem manifesto para não deixar pastas incompletas."""
+    shutil.rmtree(root / "runs" / tag, ignore_errors=True)
+    for leftover in (root / "mobility" / f"{tag}.csv", root / "raw" / f"{tag}.xml",
+                     root / "raw" / f"{tag}.xml.gz"):
+        leftover.unlink(missing_ok=True)
+
+
+def count_flow_rows(path: Path) -> int:
+    with path.open(encoding="utf-8", newline="") as handle:
+        return sum(1 for _ in csv.DictReader(handle))
+
+
 def write_run_manifest(root: Path, config: dict, profile: dict, stage: str,
                        run: tuple, flow_csv: Path, mobility: Path, flow_xml: Path,
                        command: list[str], elapsed: float, animation: bool) -> dict:
@@ -268,15 +281,24 @@ def execute_one(config: dict, profile: dict, stage: str, root: Path, run: tuple,
             return run, False, "hash da trajetória existente não confere com a execução sem animação", None
         return run, True, "retomada: artefatos completos", saved
     flow_xml = root / "raw" / f"{tag}.xml"
+    discard_partial(root, tag)
     command = build_command(config, profile, run, root, animation)
     # The stage is supplied by the runner's root manifest and appended to the simulator command.
     command[command.index("--") + 1] = f"--stage={stage}"
     start = time.monotonic()
     completed = subprocess.run(command, cwd=ROOT, text=True, capture_output=True)
     if completed.returncode:
+        discard_partial(root, tag)
         return run, False, completed.stderr[-3000:] or completed.stdout[-3000:], None
     if not flow_csv.exists() or not mobility.exists() or not flow_xml.exists():
+        discard_partial(root, tag)
         return run, False, "simulador terminou sem gerar todos os CSVs/XMLs esperados", None
+    expected_flows = len(profile["flow_pairs"])
+    produced_flows = count_flow_rows(flow_csv)
+    if produced_flows < expected_flows:
+        discard_partial(root, tag)
+        return run, False, (f"{tag}: a execução gerou {produced_flows} fluxo(s) em flows.csv; "
+                            f"esperado {expected_flows}. Artefatos descartados."), None
     if compress_xml:
         with flow_xml.open("rb") as source, gzip.open(flow_xml_gz, "wb") as target:
             shutil.copyfileobj(source, target)
@@ -284,6 +306,7 @@ def execute_one(config: dict, profile: dict, stage: str, root: Path, run: tuple,
         flow_xml = flow_xml_gz
     trajectory = hash_file(mobility)
     if animation and baseline_hash and trajectory != baseline_hash:
+        discard_partial(root, tag)
         return run, False, f"hash de mobilidade divergente: baseline={baseline_hash}, animação={trajectory}", None
     record = write_run_manifest(root, config, profile, stage, run, flow_csv, mobility,
                                 flow_xml, command, time.monotonic() - start, animation)
@@ -449,7 +472,7 @@ def main() -> int:
         configure = subprocess.run([*NS3, "configure", "--enable-examples"], cwd=ROOT)
         if configure.returncode:
             return configure.returncode
-    build = subprocess.run([*NS3, "build", "scratch_manet-routing-compare"], cwd=ROOT)
+    build = subprocess.run([*NS3, "build", "scratch/manet-routing-compare"], cwd=ROOT)
     if build.returncode:
         return build.returncode
 

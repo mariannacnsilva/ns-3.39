@@ -76,5 +76,48 @@ class ExperimentTests(unittest.TestCase):
         outcomes = dict(zip(result["protocol"], result["outcome"]))
         self.assertEqual(outcomes, {"aodv": "sustentada", "dsdv": "melhora", "olsr": "inconclusiva"})
 
+    def test_trajectory_hash_equal_across_protocols(self):
+        if not list((run_experiment.ROOT / "build" / "scratch").glob("ns3.39-manet-routing-compare-*")):
+            self.skipTest("simulador n\u00e3o compilado")
+        hashes = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            for protocol in run_experiment.PROTOCOLS:
+                trace = Path(tmp) / f"{protocol}.csv"
+                completed = run_experiment.subprocess.run(
+                    [*run_experiment.NS3, "run", "--no-build", "scratch/manet-routing-compare", "--",
+                     f"--protocol={protocol}", "--run=1", "--speed=20", "--duration=40",
+                     "--traffic-start=10", "--traffic-stop=30", f"--mobility-trace={trace}",
+                     f"--flows={Path(tmp) / (protocol + '-flows.csv')}",
+                     f"--flow-monitor={Path(tmp) / (protocol + '.xml')}"],
+                    cwd=run_experiment.ROOT, capture_output=True, text=True)
+                self.assertEqual(completed.returncode, 0, completed.stderr)
+                hashes[protocol] = run_experiment.hash_file(trace)
+        self.assertEqual(len(set(hashes.values())), 1, hashes)
+
+    def test_run_with_too_few_flows_leaves_no_partial_directory(self):
+        config = run_experiment.load_config()
+        profile = run_experiment.resolve_profile(config, "stage1")
+        run = ("olsr", 5.0, 10, 1)
+        tag = "olsr-v5-r10-run-001"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+
+            def fake_simulator(command, **kwargs):
+                flows = next(Path(a.split("=", 1)[1]) for a in command if a.startswith("--flows="))
+                mobility = next(Path(a.split("=", 1)[1]) for a in command if a.startswith("--mobility-trace="))
+                xml = next(Path(a.split("=", 1)[1]) for a in command if a.startswith("--flow-monitor="))
+                flows.write_text("flowIndex\n0\n", encoding="utf-8")
+                mobility.write_text("time_s\n", encoding="utf-8")
+                xml.write_text("<x/>", encoding="utf-8")
+                return run_experiment.subprocess.CompletedProcess(command, 0, "", "")
+
+            with patch.object(run_experiment.subprocess, "run", fake_simulator):
+                _, success, message, _ = run_experiment.execute_one(config, profile, "stage1", root, run, False)
+            self.assertFalse(success)
+            self.assertIn("1 fluxo(s)", message)
+            self.assertFalse((root / "runs" / tag).exists())
+            self.assertFalse((root / "mobility" / f"{tag}.csv").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

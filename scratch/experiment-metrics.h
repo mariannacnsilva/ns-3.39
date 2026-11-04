@@ -25,7 +25,8 @@ class MobilityRecorder
         if (!m_traceFile.empty())
         {
             m_output.open(m_traceFile);
-            m_output << std::setprecision(17) << "time_s,node_id,x_m,y_m\n";
+            // Precisão de micrômetro: ruído de ponto flutuante de consultas de posição não altera o hash.
+            m_output << std::fixed << std::setprecision(6) << "time_s,node_id,x_m,y_m\n";
         }
     }
 

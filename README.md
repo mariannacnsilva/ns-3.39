@@ -86,14 +86,12 @@ sudo apt update
 sudo apt install -y git g++ cmake ninja-build python3 python3-venv python3-pip pkg-config
 sudo apt install -y qtbase5-dev qt5-qmake  # opcional: NetAnim
 
-git clone https://github.com/mariannacnsilva/ns-3.39.git
-cd ns-3.39
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 ./ns3 configure --enable-examples
-./ns3 build scratch_manet-routing-compare
+./ns3 build scratch/manet-routing-compare
 python -m unittest tests.test_experiment -v
 ```
 

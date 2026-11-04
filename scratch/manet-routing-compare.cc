@@ -362,6 +362,7 @@ main(int argc, char* argv[])
     address.SetBase(o.ipNetwork.c_str(), o.ipMask.c_str());
     Ipv4InterfaceContainer interfaces = address.Assign(devices);
 
+    std::vector<std::shared_ptr<uint64_t>> sentPackets;
     for (const auto& pair : pairs)
     {
         PacketSinkHelper sink("ns3::UdpSocketFactory",
@@ -377,6 +378,12 @@ main(int argc, char* argv[])
         ApplicationContainer sender = client.Install(nodes.Get(pair.first));
         sender.Start(Seconds(o.trafficStartS));
         sender.Stop(Seconds(o.trafficStopS));
+        // Tx vem da aplicação: o FlowMonitor não registra o fluxo se o roteamento descarta antes do IP.
+        auto counter = std::make_shared<uint64_t>(0);
+        sentPackets.push_back(counter);
+        sender.Get(0)->TraceConnectWithoutContext(
+            "Tx",
+            Callback<void, Ptr<const Packet>>([counter](Ptr<const Packet>) { ++*counter; }));
     }
 
     FlowMonitorHelper flowHelper;
@@ -416,34 +423,38 @@ main(int argc, char* argv[])
         const auto pair = pairs[index];
         const Ipv4Address source = interfaces.GetAddress(pair.first);
         const Ipv4Address destination = interfaces.GetAddress(pair.second);
-        bool found = false;
+        // Fluxo ausente no FlowMonitor significa nenhum pacote recebido (flowId 0 = ausente).
+        uint32_t flowId = 0;
+        uint64_t rxPackets = 0;
+        uint64_t rxBytes = 0;
+        double delaySumMs = 0;
+        double jitterSumMs = 0;
         for (const auto& entry : flowStats)
         {
             const auto tuple = classifier->FindFlow(entry.first);
             if (tuple.protocol != 17 || tuple.sourceAddress != source || tuple.destinationAddress != destination ||
                 tuple.destinationPort != o.applicationPort) continue;
-            found = true;
-            const auto& stats = entry.second;
-            const double delaySumMs = stats.delaySum.GetSeconds() * 1000.0;
-            const double jitterSumMs = stats.jitterSum.GetSeconds() * 1000.0;
-            const double delayMs = stats.rxPackets ? delaySumMs / stats.rxPackets : std::numeric_limits<double>::quiet_NaN();
-            const double jitterMs = stats.rxPackets > 1 ? jitterSumMs / (stats.rxPackets - 1) : std::numeric_limits<double>::quiet_NaN();
-            const uint32_t maxPackets = static_cast<uint32_t>(std::ceil(o.ratePps * (o.trafficStopS - o.trafficStartS)) + 1.0);
-            const double throughputMbps = stats.rxBytes * 8.0 / ((o.trafficStopS - o.trafficStartS) * 1e6);
-            const double pdrPct = stats.txPackets ? 100.0 * stats.rxPackets / stats.txPackets : std::numeric_limits<double>::quiet_NaN();
-            output << o.stage << ',' << o.protocol << ',' << o.speed << ',' << o.ratePps << ',' << o.run << ','
-                   << o.seedMaster << ',' << entry.first << ',' << stats.txPackets << ',' << stats.rxPackets << ','
-                   << stats.lostPackets << ',' << stats.rxBytes << ',' << throughputMbps << ',' << pdrPct << ','
-                   << delayMs << ',' << jitterMs << ',' << delaySumMs << ',' << jitterSumMs << ','
-                   << maxPackets << ',' << index << ',' << pair.first << ',' << pair.second << ','
-                   << o.packetSizeBytes << '\n';
+            flowId = entry.first;
+            rxPackets = entry.second.rxPackets;
+            rxBytes = entry.second.rxBytes;
+            delaySumMs = entry.second.delaySum.GetSeconds() * 1000.0;
+            jitterSumMs = entry.second.jitterSum.GetSeconds() * 1000.0;
+            break;
         }
-        if (!found)
-        {
-            std::cerr << "Erro: FlowMonitor não encontrou o fluxo " << pair.first << " -> " << pair.second << ".\n";
-            Simulator::Destroy();
-            return 3;
-        }
+        const uint64_t txPackets = *sentPackets[index];
+        const uint64_t lostPackets = txPackets > rxPackets ? txPackets - rxPackets : 0;
+        const double nan = std::numeric_limits<double>::quiet_NaN();
+        const double delayMs = rxPackets ? delaySumMs / rxPackets : nan;
+        const double jitterMs = rxPackets > 1 ? jitterSumMs / (rxPackets - 1) : nan;
+        const uint32_t maxPackets = static_cast<uint32_t>(std::ceil(o.ratePps * (o.trafficStopS - o.trafficStartS)) + 1.0);
+        const double throughputMbps = rxBytes * 8.0 / ((o.trafficStopS - o.trafficStartS) * 1e6);
+        const double pdrPct = txPackets ? 100.0 * rxPackets / txPackets : nan;
+        output << o.stage << ',' << o.protocol << ',' << o.speed << ',' << o.ratePps << ',' << o.run << ','
+               << o.seedMaster << ',' << flowId << ',' << txPackets << ',' << rxPackets << ','
+               << lostPackets << ',' << rxBytes << ',' << throughputMbps << ',' << pdrPct << ','
+               << delayMs << ',' << jitterMs << ',' << delaySumMs << ',' << jitterSumMs << ','
+               << maxPackets << ',' << index << ',' << pair.first << ',' << pair.second << ','
+               << o.packetSizeBytes << '\n';
     }
     output.close();
     Simulator::Destroy();
