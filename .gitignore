@@ -1,4 +1,5 @@
 # Build artifacts
+.lock-ns3_*
 build/
 cmake-cache/
 **/CMakeFiles/
@@ -10,9 +11,10 @@ cmake-cache/
 **/*.exe
 
 # Generated simulation outputs
+results/pilot-*/
+results/animation-*/
 *.pcap
 *.tr
-results/
 venv/
 .venv/
 **/venv/

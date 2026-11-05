@@ -1,3 +1,5 @@
+import csv
+import gzip
 import json
 import math
 import tempfile
@@ -7,6 +9,7 @@ from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
 
+import pandas as pd
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import analyze
@@ -50,6 +53,9 @@ class ExperimentTests(unittest.TestCase):
         self.assertAlmostEqual(result["jitterMs"], 498 / 50)
         self.assertAlmostEqual(result["pdrPct"], 100 * 52 / 110)
         self.assertAlmostEqual(result["throughputMbps"], 26624 * 8 / 100 / 1e6)
+        repeated = [{**flow, "controlPackets": 7, "controlBytes": 70} for flow in flows]
+        control = analyze.aggregate_flows(repeated, 100)
+        self.assertEqual((control["controlPackets"], control["controlBytes"]), (7, 70))
 
     def test_repetition_validation(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -77,7 +83,7 @@ class ExperimentTests(unittest.TestCase):
         self.assertEqual(outcomes, {"aodv": "sustentada", "dsdv": "melhora", "olsr": "inconclusiva"})
 
     def test_trajectory_hash_equal_across_protocols(self):
-        if not list((run_experiment.ROOT / "build" / "scratch").glob("ns3.39-manet-routing-compare-*")):
+        if not list((run_experiment.ROOT / "build" / "scratch").glob("ns3.39-manet-routing-compare*")):
             self.skipTest("simulador n\u00e3o compilado")
         hashes = {}
         with tempfile.TemporaryDirectory() as tmp:
@@ -92,7 +98,97 @@ class ExperimentTests(unittest.TestCase):
                     cwd=run_experiment.ROOT, capture_output=True, text=True)
                 self.assertEqual(completed.returncode, 0, completed.stderr)
                 hashes[protocol] = run_experiment.hash_file(trace)
-        self.assertEqual(len(set(hashes.values())), 1, hashes)
+                with (Path(tmp) / f"{protocol}-flows.csv").open(encoding="utf-8", newline="") as handle:
+                    rows = list(csv.DictReader(handle))
+                self.assertEqual(len(rows), 4)
+                self.assertGreater(int(rows[0]["controlPackets"]), 0)
+                self.assertEqual(len({(row["controlPackets"], row["controlBytes"]) for row in rows}), 1)
+                for row in rows:
+                    self.assertEqual(row["routingProtocol"], analyze.ROUTING_TYPES[protocol])
+                    self.assertEqual(int(row["txPackets"]), 200)
+                    self.assertEqual(int(row["undeliveredPackets"]),
+                                     int(row["txPackets"]) - int(row["rxPackets"]))
+            traces = [run_experiment.read_trace(Path(tmp) / f"{protocol}.csv") for protocol in run_experiment.PROTOCOLS]
+            for trace in traces[1:]:
+                self.assertLessEqual(run_experiment.trajectory_deviation(traces[0], trace),
+                                     run_experiment.TRAJECTORY_TOLERANCE_M)
+
+    def test_hash_ignores_compression_and_gzip_is_deterministic(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            first, second = Path(tmp) / "a.csv", Path(tmp) / "b.csv"
+            first.write_bytes(b"time_s,node_id,x_m,y_m\n")
+            second.write_bytes(first.read_bytes())
+            plain_hash = run_experiment.hash_file(first)
+            run_experiment.compress_deterministic(first, Path(tmp) / "a.csv.gz")
+            run_experiment.compress_deterministic(second, Path(tmp) / "b.csv.gz")
+            self.assertEqual(run_experiment.hash_file(Path(tmp) / "a.csv.gz"), plain_hash)
+            self.assertEqual((Path(tmp) / "a.csv.gz").read_bytes(), (Path(tmp) / "b.csv.gz").read_bytes())
+            self.assertEqual(gzip.decompress((Path(tmp) / "a.csv.gz").read_bytes()), b"time_s,node_id,x_m,y_m\n")
+
+    def test_trajectory_comparison_tolerates_only_numeric_noise(self):
+        base = [(0.0, 0, 10.0, 20.0), (1.0, 0, 11.0, 20.0)]
+        noise = [(0.0, 0, 10.000001, 20.0), (1.0, 0, 11.0, 20.0)]
+        moved = [(0.0, 0, 10.5, 20.0), (1.0, 0, 11.0, 20.0)]
+        tolerance = run_experiment.TRAJECTORY_TOLERANCE_M
+        self.assertLessEqual(run_experiment.trajectory_deviation(base, noise), tolerance)
+        self.assertGreater(run_experiment.trajectory_deviation(base, moved), tolerance)
+        self.assertEqual(run_experiment.trajectory_deviation(base, base[:1]), math.inf)
+        self.assertEqual(run_experiment.trajectory_deviation(base, [(0.0, 1, 10.0, 20.0), (1.0, 0, 11.0, 20.0)]), math.inf)
+
+    def test_official_batch_refuses_uncommitted_code(self):
+        for state in ({"revision": "abc", "working_tree_dirty": True, "status_short": [" M x"]},
+                      {"revision": None, "reason": "sem git"}):
+            with patch.object(run_experiment, "git_metadata", return_value=state), \
+                 patch.object(sys, "argv", ["run_experiment.py", "--stage", "stage1"]), \
+                 patch.object(run_experiment.subprocess, "run") as simulator, redirect_stderr(StringIO()):
+                self.assertEqual(run_experiment.main(), 2)
+                simulator.assert_not_called()
+
+    def test_effective_range_matches_link_budget(self):
+        profile = run_experiment.resolve_profile(run_experiment.load_config(), "stage1")
+        self.assertAlmostEqual(analyze.effective_range_m(profile), 169.4, delta=0.5)
+        self.assertAlmostEqual(analyze.effective_range_m({**profile, "log_distance_exponent": 3.0}), 85.4, delta=0.5)
+
+    def test_trace_connectivity_uses_multihop_paths(self):
+        rows = []
+        for time_s in (10.0, 11.0):
+            for node, x in enumerate((0.0, 100.0, 200.0, 900.0)):
+                rows.append({"time_s": time_s, "node_id": node, "x_m": x, "y_m": 0.0})
+        result = analyze.trace_connectivity(pd.DataFrame(rows), [(0, 2), (0, 3)], 150.0, 10.0, 11.0)
+        self.assertAlmostEqual(result["reachPct"], 50.0)
+        self.assertAlmostEqual(result["meanDegree"], 1.0)
+        self.assertAlmostEqual(result["largestComponentPct"], 75.0)
+        self.assertAlmostEqual(result["meanHops"], 2.0)
+
+    def test_flowmonitor_xml_is_checked_against_csv(self):
+        xml = (b'<FlowMonitor><FlowStats><Flow flowId="1" rxPackets="5" rxBytes="2700" lostPackets="1" '
+               b'delaySum="+2.5e+07ns" /></FlowStats></FlowMonitor>')
+        row = {"flowId": 1, "rxPackets": 5, "rxBytes": 2700, "lostPackets": 1, "delaySumMs": 25.0}
+        analyze.check_flowmonitor(xml, [row], "ok")
+        analyze.check_flowmonitor(xml, [{**row, "flowId": 0, "rxPackets": 0}], "ausente")
+        with self.assertRaisesRegex(ValueError, "rxPackets"):
+            analyze.check_flowmonitor(xml, [{**row, "rxPackets": 6}], "x")
+        with self.assertRaisesRegex(ValueError, "delaySum"):
+            analyze.check_flowmonitor(xml, [{**row, "delaySumMs": 30.0}], "x")
+        with self.assertRaisesRegex(ValueError, "não existe"):
+            analyze.check_flowmonitor(xml, [{**row, "flowId": 9}], "x")
+
+    def test_trend_and_load_comparison(self):
+        rows = []
+        for rate, values in ((10, (90.0, 88.0, 80.0, 78.0)), (100, (50.0, 49.0, 48.0, 20.0))):
+            for speed, mean in zip((1.0, 5.0, 10.0, 20.0), values):
+                rows.append({"stage": "stage2", "protocol": "aodv", "speed": speed, "rate": rate,
+                             "metric": "pdrPct", "n_valid": 30, "mean": mean,
+                             "ci95_low": mean - 1, "ci95_high": mean + 1})
+        h1 = analyze.classify_h1(pd.DataFrame(rows), "stage2")
+        by_rate = {row.rate: row for row in h1.itertuples()}
+        self.assertEqual(by_rate[10].trend, "piora")
+        self.assertEqual(by_rate[10].worstInterval, "5 a 10 m/s")
+        self.assertEqual(by_rate[100].worstInterval, "10 a 20 m/s")
+        trend = analyze.load_trend(h1).iloc[0]
+        self.assertAlmostEqual(trend["delta20vs1LowRate"], -12.0)
+        self.assertAlmostEqual(trend["delta20vs1HighRate"], -30.0)
+        self.assertTrue(trend["sameOutcome"])
 
     def test_run_with_too_few_flows_leaves_no_partial_directory(self):
         config = run_experiment.load_config()

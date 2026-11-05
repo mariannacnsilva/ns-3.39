@@ -28,6 +28,10 @@ using namespace ns3;
 
 namespace
 {
+// Parametros fixos do cenario, documentados no README.
+const char* const WIFI_MODE = "ErpOfdmRate6Mbps";
+const uint16_t APPLICATION_PORT = 9000;
+
 struct Options
 {
     std::string stage{"stage1"};
@@ -40,9 +44,6 @@ struct Options
     uint32_t flowCount{4};
     std::string flowPairs{"0:1;2:3;4:5;6:7"};
     std::string wifiStandard{"802.11g"};
-    std::string wifiMode{"ErpOfdmRate6Mbps"};
-    uint32_t channelWidthMhz{20};
-    uint32_t channelNumber{1};
     double areaWidthM{500.0};
     double areaHeightM{500.0};
     double pauseS{10.0};
@@ -51,18 +52,13 @@ struct Options
     double trafficStartS{10.0};
     double trafficStopS{110.0};
     double txPowerDbm{16.0};
-    double txGainDb{0.0};
-    double rxGainDb{0.0};
     double rxSensitivityDbm{-101.0};
+    double preambleMinRssiDbm{-82.0};
     uint32_t rtsCtsThresholdBytes{65535};
-    double referenceLossDb{46.6777};
+    double referenceLossDb{40.05};
     double referenceDistanceM{1.0};
-    double pathLossExponent{3.0};
-    std::string propagationDelay{"ns3::ConstantSpeedPropagationDelayModel"};
-    uint16_t applicationPort{9000};
+    double pathLossExponent{2.6};
     uint32_t packetSizeBytes{512};
-    std::string ipNetwork{"10.0.0.0"};
-    std::string ipMask{"255.0.0.0"};
     int64_t initialPositionStream{10};
     int64_t mobilityStream{1000};
     double mobilityTraceIntervalS{1.0};
@@ -112,11 +108,10 @@ Validate(const Options& o, const std::vector<std::pair<uint32_t, uint32_t>>& pai
     }
     if (o.run == 0 || o.seedMaster == 0 || o.ratePps == 0 || o.flowCount == 0 ||
         o.flowCount != pairs.size() || o.nodes < 2 || o.packetSizeBytes == 0 ||
-        o.applicationPort == 0 ||
         o.initialPositionStream < 0 || o.mobilityStream < 0 ||
         o.initialPositionStream == o.mobilityStream)
     {
-        std::cerr << "Erro: run, seed, taxa, fluxos, nós, payload, porta ou streams inválidos.\n";
+        std::cerr << "Erro: run, seed, taxa, fluxos, nós, payload ou streams inválidos.\n";
         return false;
     }
     if (!std::isfinite(o.speed) || !std::isfinite(o.minimumSpeedMps) ||
@@ -138,20 +133,11 @@ Validate(const Options& o, const std::vector<std::pair<uint32_t, uint32_t>>& pai
         std::cerr << "Erro: este experimento usa somente IEEE 802.11g.\n";
         return false;
     }
-    if (o.wifiMode != "ErpOfdmRate6Mbps" || o.channelWidthMhz != 20 || o.channelNumber != 1)
-    {
-        std::cerr << "Erro: padrão, modo PHY, largura e canal Wi-Fi não formam um perfil compatível.\n";
-        return false;
-    }
-    if (o.wifiMode.empty() || o.channelWidthMhz == 0 ||
-        !std::isfinite(o.txPowerDbm) || !std::isfinite(o.referenceLossDb) ||
-        !std::isfinite(o.txGainDb) || !std::isfinite(o.rxGainDb) ||
-        !std::isfinite(o.rxSensitivityDbm) ||
+    if (!std::isfinite(o.txPowerDbm) || !std::isfinite(o.referenceLossDb) ||
+        !std::isfinite(o.rxSensitivityDbm) || !std::isfinite(o.preambleMinRssiDbm) ||
         !std::isfinite(o.referenceDistanceM) || o.referenceDistanceM <= 0 ||
         !std::isfinite(o.pathLossExponent) || o.pathLossExponent <= 0 ||
-        o.propagationDelay != "ns3::ConstantSpeedPropagationDelayModel" ||
         !std::isfinite(o.mobilityTraceIntervalS) || o.mobilityTraceIntervalS <= 0 ||
-        o.ipNetwork.empty() || o.ipMask.empty() ||
         o.flowsPath.empty() || o.mobilityPath.empty() || o.flowMonitorPath.empty())
     {
         std::cerr << "Erro: parâmetros de rádio, trace ou caminhos de saída inválidos.\n";
@@ -190,6 +176,14 @@ Validate(const Options& o, const std::vector<std::pair<uint32_t, uint32_t>>& pai
     return true;
 }
 
+uint16_t
+ControlPort(const std::string& protocol)
+{
+    if (protocol == "aodv") return 654;
+    if (protocol == "dsdv") return 269;
+    return 698; // OLSR
+}
+
 void
 InstallRouting(InternetStackHelper& stack, const std::string& protocol)
 {
@@ -214,7 +208,8 @@ void
 ConfigureAnimation(AnimationInterface& animation,
                    const NodeContainer& nodes,
                    const Options& o,
-                   const std::string& routePath)
+                   const std::string& routePath,
+                   const std::vector<std::pair<uint32_t, uint32_t>>& pairs)
 {
     animation.SetStartTime(Seconds(o.animationStartS));
     animation.SetStopTime(Seconds(o.animationStopS));
@@ -228,10 +223,17 @@ ConfigureAnimation(AnimationInterface& animation,
             << o.ratePps << " pps/fluxo | seed=" << o.seedMaster << " | run=" << o.run;
     for (uint32_t i = 0; i < nodes.GetN(); ++i)
     {
-        const std::string role = i == 0 ? "Origem" : (i == 1 ? "Destino" : "Relay");
+        bool isSource = false;
+        bool isDestination = false;
+        for (const auto& pair : pairs)
+        {
+            isSource = isSource || pair.first == i;
+            isDestination = isDestination || pair.second == i;
+        }
+        const std::string role = isSource ? "Origem" : (isDestination ? "Destino" : "Relay");
         animation.UpdateNodeDescription(i, title.str() + " | " + std::to_string(i) + " - " + role);
-        if (i == 0) { animation.UpdateNodeColor(i, 220, 55, 55); animation.UpdateNodeSize(i, 8, 8); }
-        else if (i == 1) { animation.UpdateNodeColor(i, 55, 100, 220); animation.UpdateNodeSize(i, 8, 8); }
+        if (isSource) { animation.UpdateNodeColor(i, 220, 55, 55); animation.UpdateNodeSize(i, 8, 8); }
+        else if (isDestination) { animation.UpdateNodeColor(i, 55, 100, 220); animation.UpdateNodeSize(i, 8, 8); }
         else { animation.UpdateNodeColor(i, 245, 180, 40); animation.UpdateNodeSize(i, 5, 5); }
     }
 }
@@ -254,9 +256,6 @@ main(int argc, char* argv[])
     ADD("flow-count", "Quantidade de fluxos UDP", flowCount);
     ADD("flow-pairs", "Pares como 0:1;2:3", flowPairs);
     ADD("wifi-standard", "Padrão Wi-Fi", wifiStandard);
-    ADD("wifi-mode", "Modo PHY fixo", wifiMode);
-    ADD("channel-width", "Largura do canal (MHz)", channelWidthMhz);
-    ADD("channel-number", "Número do canal", channelNumber);
     ADD("area-width", "Largura da área (m)", areaWidthM);
     ADD("area-height", "Altura da área (m)", areaHeightM);
     ADD("pause", "Pausa de RandomWaypoint (s)", pauseS);
@@ -265,18 +264,13 @@ main(int argc, char* argv[])
     ADD("traffic-start", "Início do tráfego (s)", trafficStartS);
     ADD("traffic-stop", "Fim do tráfego (s)", trafficStopS);
     ADD("tx-power", "Potência de transmissão (dBm)", txPowerDbm);
-    ADD("tx-gain", "Ganho de transmissão (dB)", txGainDb);
-    ADD("rx-gain", "Ganho de recepção (dB)", rxGainDb);
     ADD("rx-sensitivity", "Sensibilidade de recepção (dBm)", rxSensitivityDbm);
+    ADD("preamble-min-rssi", "RSSI mínimo para detectar o preâmbulo (dBm)", preambleMinRssiDbm);
     ADD("rts-cts-threshold", "Limiar RTS/CTS (bytes)", rtsCtsThresholdBytes);
     ADD("reference-loss", "Perda de referência (dB)", referenceLossDb);
     ADD("reference-distance", "Distância de referência (m)", referenceDistanceM);
     ADD("path-loss-exponent", "Expoente LogDistance", pathLossExponent);
-    ADD("propagation-delay", "Modelo de atraso de propagação", propagationDelay);
-    ADD("application-port", "Porta UDP de aplicação", applicationPort);
     ADD("packet-size", "Payload UDP (bytes)", packetSizeBytes);
-    ADD("ip-network", "Rede IPv4", ipNetwork);
-    ADD("ip-mask", "Máscara IPv4", ipMask);
     ADD("initial-position-stream", "Stream explícito para posições iniciais", initialPositionStream);
     ADD("mobility-stream", "Stream explícito para RandomWaypoint", mobilityStream);
     ADD("mobility-trace-interval", "Intervalo do trace (s)", mobilityTraceIntervalS);
@@ -309,22 +303,20 @@ main(int argc, char* argv[])
 
     WifiHelper wifi;
     wifi.SetStandard(WIFI_STANDARD_80211g);
-    wifi.SetRemoteStationManager("ns3::ConstantRateWifiManager", "DataMode", StringValue(o.wifiMode),
-                                 "ControlMode", StringValue(o.wifiMode),
-                                 "NonUnicastMode", StringValue(o.wifiMode),
+    wifi.SetRemoteStationManager("ns3::ConstantRateWifiManager", "DataMode", StringValue(WIFI_MODE),
+                                 "ControlMode", StringValue(WIFI_MODE),
+                                 "NonUnicastMode", StringValue(WIFI_MODE),
                                  "RtsCtsThreshold", UintegerValue(o.rtsCtsThresholdBytes));
     YansWifiPhyHelper phy;
-    std::ostringstream channelSettings;
-    channelSettings << "{" << o.channelNumber << ", " << o.channelWidthMhz
-                    << ", BAND_2_4GHZ, 0}";
-    phy.Set("ChannelSettings", StringValue(channelSettings.str()));
+    phy.Set("ChannelSettings", StringValue("{1, 20, BAND_2_4GHZ, 0}"));
     phy.Set("TxPowerStart", DoubleValue(o.txPowerDbm));
     phy.Set("TxPowerEnd", DoubleValue(o.txPowerDbm));
-    phy.Set("TxGain", DoubleValue(o.txGainDb));
-    phy.Set("RxGain", DoubleValue(o.rxGainDb));
     phy.Set("RxSensitivity", DoubleValue(o.rxSensitivityDbm));
+    // Este limite define o alcance efetivo: quadros abaixo dele são descartados na detecção do preâmbulo.
+    phy.SetPreambleDetectionModel("ns3::ThresholdPreambleDetectionModel",
+                                  "MinimumRssi", DoubleValue(o.preambleMinRssiDbm));
     YansWifiChannelHelper channel;
-    channel.SetPropagationDelay(o.propagationDelay);
+    channel.SetPropagationDelay("ns3::ConstantSpeedPropagationDelayModel");
     channel.AddPropagationLoss("ns3::LogDistancePropagationLossModel", "Exponent", DoubleValue(o.pathLossExponent),
                                "ReferenceDistance", DoubleValue(o.referenceDistanceM),
                                "ReferenceLoss", DoubleValue(o.referenceLossDb));
@@ -358,25 +350,30 @@ main(int argc, char* argv[])
     InternetStackHelper stack;
     InstallRouting(stack, o.protocol);
     stack.Install(nodes);
+    const std::string routingProtocol =
+        nodes.Get(0)->GetObject<Ipv4>()->GetRoutingProtocol()->GetInstanceTypeId().GetName();
     Ipv4AddressHelper address;
-    address.SetBase(o.ipNetwork.c_str(), o.ipMask.c_str());
+    address.SetBase("10.0.0.0", "255.0.0.0");
     Ipv4InterfaceContainer interfaces = address.Assign(devices);
 
     std::vector<std::shared_ptr<uint64_t>> sentPackets;
+    size_t startIndex = 0;
     for (const auto& pair : pairs)
     {
         PacketSinkHelper sink("ns3::UdpSocketFactory",
-            InetSocketAddress(Ipv4Address::GetAny(), o.applicationPort));
+            InetSocketAddress(Ipv4Address::GetAny(), APPLICATION_PORT));
         ApplicationContainer receiver = sink.Install(nodes.Get(pair.second));
         receiver.Start(Seconds(0));
         receiver.Stop(Seconds(o.durationS));
-        UdpClientHelper client(interfaces.GetAddress(pair.second), o.applicationPort);
+        UdpClientHelper client(interfaces.GetAddress(pair.second), APPLICATION_PORT);
         client.SetAttribute("PacketSize", UintegerValue(o.packetSizeBytes));
         client.SetAttribute("Interval", TimeValue(Seconds(1.0 / o.ratePps)));
         client.SetAttribute("MaxPackets", UintegerValue(static_cast<uint32_t>(
             std::ceil(o.ratePps * (o.trafficStopS - o.trafficStartS)) + 1.0)));
         ApplicationContainer sender = client.Install(nodes.Get(pair.first));
-        sender.Start(Seconds(o.trafficStartS));
+        // Defasagem determinística: fluxos sincronizados colidem de forma repetida, um artefato do simulador.
+        sender.Start(Seconds(o.trafficStartS + startIndex * (1.0 / o.ratePps) / pairs.size()));
+        ++startIndex;
         sender.Stop(Seconds(o.trafficStopS));
         // Tx vem da aplicação: o FlowMonitor não registra o fluxo se o roteamento descarta antes do IP.
         auto counter = std::make_shared<uint64_t>(0);
@@ -388,6 +385,9 @@ main(int argc, char* argv[])
 
     FlowMonitorHelper flowHelper;
     Ptr<FlowMonitor> monitor = flowHelper.InstallAll();
+    experiment::ControlTrafficCounter control(ControlPort(o.protocol));
+    Config::ConnectWithoutContext("/NodeList/*/$ns3::Ipv4L3Protocol/Tx",
+                                  MakeCallback(&experiment::ControlTrafficCounter::OnIpv4Tx, &control));
     experiment::MobilityRecorder recorder(nodes, o.durationS, o.mobilityTraceIntervalS, o.mobilityPath);
     if (!recorder.IsOpen())
     {
@@ -399,7 +399,7 @@ main(int argc, char* argv[])
     if (o.animation)
     {
         animation = std::make_unique<AnimationInterface>(o.animationPath);
-        ConfigureAnimation(*animation, nodes, o, o.animationPath + ".routes.xml");
+        ConfigureAnimation(*animation, nodes, o, o.animationPath + ".routes.xml", pairs);
     }
 
     Simulator::Stop(Seconds(o.durationS));
@@ -416,7 +416,7 @@ main(int argc, char* argv[])
         Simulator::Destroy();
         return 2;
     }
-    output << "stage,protocol,speed,rate,run,seed,flowId,txPackets,rxPackets,lostPackets,rxBytes,throughputMbps,pdrPct,delayMs,jitterMs,delaySumMs,jitterSumMs,maxPackets,flowIndex,sourceNode,destinationNode,packetSizeBytes\n";
+    output << "stage,protocol,speed,rate,run,seed,flowId,txPackets,rxPackets,lostPackets,rxBytes,throughputMbps,pdrPct,delayMs,jitterMs,delaySumMs,jitterSumMs,maxPackets,flowIndex,sourceNode,destinationNode,packetSizeBytes,undeliveredPackets,routingProtocol,controlPackets,controlBytes\n";
     output << std::setprecision(17);
     for (size_t index = 0; index < pairs.size(); ++index)
     {
@@ -429,20 +429,22 @@ main(int argc, char* argv[])
         uint64_t rxBytes = 0;
         double delaySumMs = 0;
         double jitterSumMs = 0;
+        uint64_t lostPackets = 0;
         for (const auto& entry : flowStats)
         {
             const auto tuple = classifier->FindFlow(entry.first);
             if (tuple.protocol != 17 || tuple.sourceAddress != source || tuple.destinationAddress != destination ||
-                tuple.destinationPort != o.applicationPort) continue;
+                tuple.destinationPort != APPLICATION_PORT) continue;
             flowId = entry.first;
             rxPackets = entry.second.rxPackets;
             rxBytes = entry.second.rxBytes;
             delaySumMs = entry.second.delaySum.GetSeconds() * 1000.0;
             jitterSumMs = entry.second.jitterSum.GetSeconds() * 1000.0;
+            lostPackets = entry.second.lostPackets;
             break;
         }
         const uint64_t txPackets = *sentPackets[index];
-        const uint64_t lostPackets = txPackets > rxPackets ? txPackets - rxPackets : 0;
+        const uint64_t undeliveredPackets = txPackets > rxPackets ? txPackets - rxPackets : 0;
         const double nan = std::numeric_limits<double>::quiet_NaN();
         const double delayMs = rxPackets ? delaySumMs / rxPackets : nan;
         const double jitterMs = rxPackets > 1 ? jitterSumMs / (rxPackets - 1) : nan;
@@ -454,7 +456,8 @@ main(int argc, char* argv[])
                << lostPackets << ',' << rxBytes << ',' << throughputMbps << ',' << pdrPct << ','
                << delayMs << ',' << jitterMs << ',' << delaySumMs << ',' << jitterSumMs << ','
                << maxPackets << ',' << index << ',' << pair.first << ',' << pair.second << ','
-               << o.packetSizeBytes << '\n';
+               << o.packetSizeBytes << ',' << undeliveredPackets << ',' << routingProtocol << ','
+               << control.Packets() << ',' << control.Bytes() << '\n';
     }
     output.close();
     Simulator::Destroy();

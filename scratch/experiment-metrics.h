@@ -5,10 +5,45 @@
 #include <string>
 #include <utility>
 
+#include "ns3/internet-module.h"
 #include "ns3/mobility-module.h"
 
 namespace experiment
 {
+
+// Conta, na saida IP de todos os nos, os datagramas UDP da porta do protocolo de roteamento.
+// Inclui retransmissoes de controle por outros nos; nao mede tempo de canal nem energia.
+class ControlTrafficCounter
+{
+  public:
+    explicit ControlTrafficCounter(uint16_t protocolPort) : m_port(protocolPort) {}
+
+    void OnIpv4Tx(ns3::Ptr<const ns3::Packet> packet, ns3::Ptr<ns3::Ipv4>, uint32_t)
+    {
+        ns3::Ptr<ns3::Packet> copy = packet->Copy();
+        ns3::Ipv4Header ipHeader;
+        if (copy->RemoveHeader(ipHeader) == 0 || ipHeader.GetProtocol() != 17)
+        {
+            return;
+        }
+        ns3::UdpHeader udpHeader;
+        if (copy->RemoveHeader(udpHeader) == 0 ||
+            (udpHeader.GetSourcePort() != m_port && udpHeader.GetDestinationPort() != m_port))
+        {
+            return;
+        }
+        ++m_packets;
+        m_bytes += packet->GetSize();
+    }
+
+    uint64_t Packets() const { return m_packets; }
+    uint64_t Bytes() const { return m_bytes; }
+
+  private:
+    uint16_t m_port;
+    uint64_t m_packets{0};
+    uint64_t m_bytes{0};
+};
 
 class MobilityRecorder
 {

@@ -5,10 +5,12 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import csv
+import datetime
 import gzip
 import hashlib
 import json
 import math
+import re
 import shutil
 import subprocess
 import sys
@@ -20,6 +22,9 @@ CONFIG_PATH = ROOT / "config" / "experiment.json"
 EXPERIMENT_DIR = ROOT / "experiments" / "manet-routing"
 NS3 = [sys.executable, str(ROOT / "ns3")]
 PROTOCOLS = ("aodv", "olsr", "dsdv")
+# O ns-3 integra a posição a cada consulta, e o tráfego muda quantas consultas ocorrem. O resíduo numérico
+# altera a última casa decimal do trace; por isso o pareamento compara posições, e não o hash do texto.
+TRAJECTORY_TOLERANCE_M = 1e-3
 
 
 def load_config(path: Path = CONFIG_PATH) -> dict:
@@ -70,61 +75,57 @@ def matrix(config: dict, stage: str, repetitions: int | None = None,
 
 
 def hash_file(path: Path) -> str:
+    # O hash é sempre do conteúdo descomprimido, para não depender da compactação.
     digest = hashlib.sha256()
-    with path.open("rb") as source:
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "rb") as source:
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
 
 
-def directory_size(path: Path) -> int:
-    return sum(item.stat().st_size for item in path.rglob("*") if item.is_file())
+def read_trace(path: Path) -> list[tuple[float, int, float, float]]:
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "rt", encoding="utf-8", newline="") as source:
+        reader = csv.reader(source)
+        next(reader)
+        return [(float(t), int(node), float(x), float(y)) for t, node, x, y in reader]
 
 
-def uncompressed_directory_size(path: Path) -> int:
-    total = 0
-    for item in path.rglob("*"):
-        if not item.is_file():
-            continue
-        if item.suffix == ".gz":
-            with gzip.open(item, "rb") as source:
-                total += sum(len(chunk) for chunk in iter(lambda: source.read(1024 * 1024), b""))
-        else:
-            total += item.stat().st_size
-    return total
+def trajectory_deviation(first: list, second: list) -> float:
+    """Maior diferença de coordenada, em metros; infinita se as amostras não coincidem."""
+    if len(first) != len(second):
+        return math.inf
+    deviation = 0.0
+    for a, b in zip(first, second):
+        if a[0] != b[0] or a[1] != b[1]:
+            return math.inf
+        deviation = max(deviation, abs(a[2] - b[2]), abs(a[3] - b[3]))
+    return deviation
 
 
-def compress_flowmonitor_outputs(root: Path) -> int:
-    compressed = 0
-    for manifest_path in (root / "runs").glob("*.manifest.json"):
-        run_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-        flow_xml = root / run_manifest["files"]["flowmonitor"]
-        if not flow_xml.exists() or flow_xml.suffix == ".gz":
-            continue
-        compressed_path = Path(str(flow_xml) + ".gz")
-        with flow_xml.open("rb") as source, gzip.open(compressed_path, "wb") as target:
+def same_trajectory(first: Path, second: Path) -> bool:
+    return trajectory_deviation(read_trace(first), read_trace(second)) <= TRAJECTORY_TOLERANCE_M
+
+
+def compress_deterministic(source_path: Path, target_path: Path) -> None:
+    """Comprime sem nome nem data no cabeçalho: mesma entrada, mesmos bytes."""
+    with source_path.open("rb") as source, target_path.open("wb") as raw:
+        with gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as target:
             shutil.copyfileobj(source, target)
-        flow_xml.unlink()
-        run_manifest["files"]["flowmonitor"] = str(compressed_path.relative_to(root))
-        run_manifest["flowmonitor_compression"] = "gzip"
-        manifest_path.write_text(json.dumps(run_manifest, indent=2, ensure_ascii=False), encoding="utf-8")
-        compressed += 1
-    return compressed
+    source_path.unlink()
 
 
-def pilot_size_projection(root: Path, expected_runs: int) -> dict:
-    fixed_bytes = sum(path.stat().st_size for path in root.iterdir()
-                      if path.is_file() and path.name != "flows.csv")
-    variable_dirs = [root / "raw", root / "mobility", root / "runs"]
-    observed_variable = sum(directory_size(path) for path in variable_dirs if path.exists())
-    combined_flows = root / "flows.csv"
-    if combined_flows.exists():
-        observed_variable += combined_flows.stat().st_size
-    completed_runs = len(list((root / "runs").glob("*.manifest.json")))
-    projected_variable = math.ceil(observed_variable * expected_runs / completed_runs) if completed_runs else 0
-    return {"observed_bytes": directory_size(root), "observed_runs": completed_runs,
-            "expected_official_runs": expected_runs,
-            "projected_uncompressed_official_bytes": fixed_bytes + projected_variable}
+def utc_now() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds")
+
+
+def build_profile() -> str | None:
+    lock = ROOT / ".lock-ns3_linux_build"
+    if not lock.exists():
+        return None
+    found = re.search(r"^BUILD_PROFILE = '([^']*)'", lock.read_text(encoding="utf-8"), re.MULTILINE)
+    return found.group(1) if found else None
 
 
 def git_metadata(directory: Path) -> dict:
@@ -135,7 +136,8 @@ def git_metadata(directory: Path) -> dict:
             return ""
         return result.stdout.strip()
     revision = read_git("log", "-1", "--format=%H")
-    status = read_git("status", "--short")
+    # Os dados do próprio lote não contam como alteração do código.
+    status = read_git("status", "--short", "--", ".", ":!experiments/manet-routing")
     if not revision:
         return {"revision": None,
                 "reason": "diretório sem metadados Git acessíveis; o código foi executado a partir dos arquivos locais."}
@@ -166,21 +168,17 @@ def build_command(config: dict, profile: dict, run: tuple, root: Path,
             f"--speed={speed}", f"--rate={rate}", f"--nodes={profile['nodes']}",
             f"--flow-count={len(profile['flow_pairs'])}",
             f"--flow-pairs={';'.join(f'{a}:{b}' for a, b in profile['flow_pairs'])}",
-            f"--wifi-standard={profile['wifi_standard']}", f"--wifi-mode={profile['wifi_mode']}",
-            f"--channel-width={profile['channel_width_mhz']}", f"--channel-number={profile['channel_number']}",
+            f"--wifi-standard={profile['wifi_standard']}",
             f"--area-width={profile['area_width_m']}", f"--area-height={profile['area_height_m']}",
             f"--pause={profile['pause_s']}", f"--minimum-speed={profile['minimum_speed_mps']}",
             f"--duration={profile['duration_s']}", f"--traffic-start={profile['traffic_start_s']}",
             f"--traffic-stop={profile['traffic_stop_s']}", f"--tx-power={profile['tx_power_dbm']}",
-            f"--tx-gain={profile['tx_gain_db']}", f"--rx-gain={profile['rx_gain_db']}",
             f"--rx-sensitivity={profile['rx_sensitivity_dbm']}",
+            f"--preamble-min-rssi={profile['preamble_minimum_rssi_dbm']}",
             f"--rts-cts-threshold={profile['rts_cts_threshold_bytes']}",
             f"--reference-loss={profile['reference_loss_db']}",
             f"--reference-distance={profile['reference_distance_m']}",
             f"--path-loss-exponent={profile['log_distance_exponent']}",
-            f"--propagation-delay=ns3::{profile['propagation_delay']}",
-            f"--application-port={profile['application_port']}",
-            f"--ip-network={config['ipv4']['network']}", f"--ip-mask={config['ipv4']['mask']}",
             f"--packet-size={profile['packet_size_bytes']}",
             f"--initial-position-stream={profile['initial_position_stream']}",
             f"--mobility-stream={profile['mobility_stream']}",
@@ -211,7 +209,8 @@ def run_stage(root: Path) -> str:
 def discard_partial(root: Path, tag: str) -> None:
     """Remove artefatos de uma execução sem manifesto para não deixar pastas incompletas."""
     shutil.rmtree(root / "runs" / tag, ignore_errors=True)
-    for leftover in (root / "mobility" / f"{tag}.csv", root / "raw" / f"{tag}.xml",
+    for leftover in (root / "mobility" / f"{tag}.csv", root / "mobility" / f"{tag}.csv.gz",
+                     root / "raw" / f"{tag}.xml",
                      root / "raw" / f"{tag}.xml.gz"):
         leftover.unlink(missing_ok=True)
 
@@ -226,12 +225,7 @@ def write_run_manifest(root: Path, config: dict, profile: dict, stage: str,
                        command: list[str], elapsed: float, animation: bool) -> dict:
     protocol, speed, rate, run_id = run
     root_metadata = json.loads((root / "manifest.json").read_text(encoding="utf-8")) if (root / "manifest.json").exists() else {}
-    project_git = root_metadata.get("project_git")
-    ns3_git = root_metadata.get("ns3_git")
-    if project_git is None:
-        project_git = git_metadata(ROOT)
-    if ns3_git is None:
-        ns3_git = git_metadata(ROOT)
+    project_git = root_metadata.get("project_git") or git_metadata(ROOT)
     files = {"flows": str(flow_csv.relative_to(root)),
              "mobility": str(mobility.relative_to(root)),
              "flowmonitor": str(flow_xml.relative_to(root))}
@@ -244,8 +238,9 @@ def write_run_manifest(root: Path, config: dict, profile: dict, stage: str,
               "seed": config["experiment"]["seed_master"],
               "configuration_sha256": hashlib.sha256(json.dumps(config, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
               "trajectory_sha256": hash_file(mobility), "command": command,
-              "elapsed_seconds": elapsed, "ns3_version": config["experiment"]["ns3_version"],
-              "project_git": project_git, "ns3_git": ns3_git,
+              "elapsed_seconds": elapsed, "finished_at_utc": utc_now(), "build_profile": build_profile(),
+              "ns3_version": config["experiment"]["ns3_version"],
+              "project_git": project_git,
               "profile": profile, "files": files}
     manifest = root / "runs" / f"{protocol}-v{speed:g}-r{rate}-run-{run_id:03d}.manifest.json"
     manifest.write_text(json.dumps(record, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -253,20 +248,17 @@ def write_run_manifest(root: Path, config: dict, profile: dict, stage: str,
 
 
 def execute_one(config: dict, profile: dict, stage: str, root: Path, run: tuple,
-                animation: bool, baseline_root: Path | None = None,
-                compress_xml: bool = False) -> tuple[tuple, bool, str, dict | None]:
+                animation: bool, baseline_root: Path | None = None) -> tuple[tuple, bool, str, dict | None]:
     protocol, speed, rate, run_id = run
     tag = f"{protocol}-v{speed:g}-r{rate}-run-{run_id:03d}"
     run_dir = root / "runs" / tag
     flow_csv = run_dir / "flows.csv"
     mobility = root / "mobility" / f"{tag}.csv"
+    mobility_gz = Path(str(mobility) + ".gz")
     flow_xml = root / "raw" / f"{tag}.xml"
     flow_xml_gz = Path(str(flow_xml) + ".gz")
     manifest_path = root / "runs" / f"{tag}.manifest.json"
-    if manifest_path.exists():
-        prior = json.loads(manifest_path.read_text(encoding="utf-8"))
-        flow_xml = root / prior.get("files", {}).get("flowmonitor", str(flow_xml.relative_to(root)))
-    baseline_hash = None
+    baseline_mobility = None
     if animation and baseline_root is not None:
         base_manifest = baseline_root / "runs" / f"{tag}.manifest.json"
         if not base_manifest.exists():
@@ -274,13 +266,13 @@ def execute_one(config: dict, profile: dict, stage: str, root: Path, run: tuple,
             if not baseline_result[1]:
                 return run, False, f"baseline sem animação falhou: {baseline_result[2]}", None
         if base_manifest.exists():
-            baseline_hash = json.loads(base_manifest.read_text(encoding="utf-8"))["trajectory_sha256"]
-    if flow_csv.exists() and mobility.exists() and (flow_xml.exists() or flow_xml_gz.exists()) and manifest_path.exists():
+            base_record = json.loads(base_manifest.read_text(encoding="utf-8"))
+            baseline_mobility = baseline_root / base_record["files"]["mobility"]
+    if flow_csv.exists() and mobility_gz.exists() and flow_xml_gz.exists() and manifest_path.exists():
         saved = json.loads(manifest_path.read_text(encoding="utf-8"))
-        if animation and baseline_hash and saved.get("trajectory_sha256") != baseline_hash:
-            return run, False, "hash da trajetória existente não confere com a execução sem animação", None
+        if animation and baseline_mobility and not same_trajectory(root / saved["files"]["mobility"], baseline_mobility):
+            return run, False, "a trajetória existente não confere com a execução sem animação", None
         return run, True, "retomada: artefatos completos", saved
-    flow_xml = root / "raw" / f"{tag}.xml"
     discard_partial(root, tag)
     command = build_command(config, profile, run, root, animation)
     # The stage is supplied by the runner's root manifest and appended to the simulator command.
@@ -299,15 +291,14 @@ def execute_one(config: dict, profile: dict, stage: str, root: Path, run: tuple,
         discard_partial(root, tag)
         return run, False, (f"{tag}: a execução gerou {produced_flows} fluxo(s) em flows.csv; "
                             f"esperado {expected_flows}. Artefatos descartados."), None
-    if compress_xml:
-        with flow_xml.open("rb") as source, gzip.open(flow_xml_gz, "wb") as target:
-            shutil.copyfileobj(source, target)
-        flow_xml.unlink()
-        flow_xml = flow_xml_gz
+    compress_deterministic(flow_xml, flow_xml_gz)
+    flow_xml = flow_xml_gz
     trajectory = hash_file(mobility)
-    if animation and baseline_hash and trajectory != baseline_hash:
+    if animation and baseline_mobility and not same_trajectory(mobility, baseline_mobility):
         discard_partial(root, tag)
-        return run, False, f"hash de mobilidade divergente: baseline={baseline_hash}, animação={trajectory}", None
+        return run, False, "a trajetória da animação diverge da execução sem animação", None
+    compress_deterministic(mobility, mobility_gz)
+    mobility = mobility_gz
     record = write_run_manifest(root, config, profile, stage, run, flow_csv, mobility,
                                 flow_xml, command, time.monotonic() - start, animation)
     if animation:
@@ -421,18 +412,12 @@ def main() -> int:
     parser.add_argument("--pilot-runs", type=int, help="número de runs do piloto (mínimo 2 para análise)")
     parser.add_argument("--animation", action="store_true", help="gera as animações do perfil escolhido")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--output", type=Path, help="diretório de saída específico")
     parser.add_argument("--jobs", type=int, default=1)
-    parser.add_argument("--protocol", choices=PROTOCOLS)
-    parser.add_argument("--speed", type=float)
-    parser.add_argument("--rate", type=int)
-    parser.add_argument("--run", type=int)
     args = parser.parse_args()
     if args.jobs < 1:
         parser.error("--jobs deve ser pelo menos 1")
-    if args.animation and (args.pilot or args.pilot_runs is not None or any(
-            value is not None for value in (args.protocol, args.speed, args.rate, args.run))):
-        parser.error("Animação é modo independente e não pode ser combinada com piloto ou cenário único.")
+    if args.animation and (args.pilot or args.pilot_runs is not None):
+        parser.error("Animação é modo independente e não pode ser combinada com piloto.")
     config = load_config(args.config)
     profile = resolve_profile(config, args.stage)
     if args.animation and args.stage != "stage1":
@@ -442,18 +427,17 @@ def main() -> int:
         parser.error("--pilot-runs deve ser positivo.")
     mode = "animation" if args.animation else ("pilot" if pilot_count is not None else "official")
     runs = matrix(config, args.stage, pilot_count, args.animation)
-    selections = (args.protocol, args.speed, args.rate, args.run)
-    if any(item is not None for item in selections):
-        if any(item is None for item in selections) or args.animation or pilot_count is not None:
-            parser.error("Para um cenário isolado informe --protocol, --speed, --rate e --run juntos.")
-        runs = [(args.protocol, args.speed, args.rate, args.run)]
-        mode = "single"
-    root = args.output.resolve() if args.output else output_root(args.stage, mode, pilot_count or 0)
+    root = output_root(args.stage, mode, pilot_count or 0)
     if args.dry_run:
         print(f"Etapa: {args.stage}; modo: {mode}; execuções: {len(runs)}; saída: {root}")
         for protocol, speed, rate, run_id in runs:
             print(f"{protocol} | {speed:g} m/s | {rate} pps/fluxo | run={run_id} | seed={config['experiment']['seed_master']}")
         return 0
+    code_state = git_metadata(ROOT)
+    if mode == "official" and (not code_state.get("revision") or code_state.get("working_tree_dirty")):
+        print("Erro: o lote oficial exige o código commitado, para que os dados apontem para uma revisão exata. "
+              f"Alterações pendentes: {code_state.get('status_short', code_state.get('reason'))}", file=sys.stderr)
+        return 2
     if args.stage == "stage2" and mode in ("official", "pilot"):
         require_stage1_baseline(mode, pilot_count or profile["repetitions"])
     if root.exists() and any(root.iterdir()):
@@ -467,9 +451,13 @@ def main() -> int:
         if not same:
             print(f"Erro: saída {root} já pertence a outra etapa, modo ou configuração.", file=sys.stderr)
             return 2
+        if mode == "official" and previous.get("project_git", {}).get("revision") != code_state.get("revision"):
+            print(f"Erro: {root} foi iniciada em outra revisão do código; não misture binários no mesmo lote.",
+                  file=sys.stderr)
+            return 2
     root.mkdir(parents=True, exist_ok=True)
     if next(ROOT.rglob("CMakeCache.txt"), None) is None:
-        configure = subprocess.run([*NS3, "configure", "--enable-examples"], cwd=ROOT)
+        configure = subprocess.run([*NS3, "configure", "-d", "release"], cwd=ROOT)
         if configure.returncode:
             return configure.returncode
     build = subprocess.run([*NS3, "build", "scratch/manet-routing-compare"], cwd=ROOT)
@@ -477,27 +465,12 @@ def main() -> int:
         return build.returncode
 
     config_hash = hashlib.sha256(json.dumps(config, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-    size_limit_bytes = int(config["experiment"]["data_size_limit_mb"] * 1024 * 1024)
-    compress_xml = False
-    compression_basis = None
-    if mode == "official":
-        for candidate_runs in (3, 1):
-            pilot_manifest_path = ROOT / "results" / f"pilot-{args.stage}-{candidate_runs}" / "manifest.json"
-            if not pilot_manifest_path.exists():
-                continue
-            pilot_manifest = json.loads(pilot_manifest_path.read_text(encoding="utf-8"))
-            estimate = pilot_manifest.get("storage_estimate", {}).get("projected_uncompressed_official_bytes")
-            if estimate is not None:
-                compression_basis = estimate
-                compress_xml = estimate > size_limit_bytes
-                break
     metadata = {"stage": args.stage, "mode": mode, "expected_runs": len(runs),
+                "started_at_utc": utc_now(), "build_profile": build_profile(),
                 "expected_repetitions_per_cell": pilot_count or profile["repetitions"],
-                "config_sha256": config_hash, "config": config,
+                "config_sha256": config_hash,
                 "profile": profile, "ns3_version": config["experiment"]["ns3_version"],
-                "project_git": git_metadata(ROOT), "ns3_git": git_metadata(ROOT),
-                "flowmonitor_gzip_recommended_by_pilot": compress_xml,
-                "compression_projection_bytes": compression_basis}
+                "project_git": git_metadata(ROOT)}
     (root / "config.json").write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
     (root / "manifest.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
     baseline_root = None
@@ -513,31 +486,46 @@ def main() -> int:
     failed = False
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.jobs) as executor:
         jobs = [executor.submit(execute_one, config, profile, args.stage, root, run,
-                                args.animation, baseline_root, compress_xml) for run in runs]
+                                args.animation, baseline_root) for run in runs]
         for index, future in enumerate(concurrent.futures.as_completed(jobs), start=1):
             run, success, message, _ = future.result()
-            print(f"[{index}/{len(runs)}] {run}: {message}", file=sys.stdout if success else sys.stderr, flush=True)
+            line = f"[{index}/{len(runs)}] {run}: {message}"
+            print(line, file=sys.stdout if success else sys.stderr, flush=True)
+            with (root / "progress.log").open("a", encoding="utf-8") as log:
+                log.write(f"{utc_now()} {line}\n")
             failed |= not success
     if not args.animation:
         manifests = [json.loads(path.read_text(encoding="utf-8")) for path in sorted((root / "runs").glob("*.manifest.json"))]
-        hashes: dict[tuple[float, int], set[str]] = {}
+        references: dict[tuple[float, int], list] = {}
+        mismatch, max_deviation = [], 0.0
         for item in manifests:
             if item.get("stage") != args.stage or item.get("kind") != "metrics":
                 failed = True
                 continue
-            hashes.setdefault((item["speed"], item["run"]), set()).add(item["trajectory_sha256"])
-        mismatch = [key for key, values in hashes.items() if len(values) != 1]
+            key = (item["speed"], item["run"])
+            trace = read_trace(root / item["files"]["mobility"])
+            deviation = trajectory_deviation(references.setdefault(key, trace), trace)
+            max_deviation = max(max_deviation, deviation)
+            if deviation > TRAJECTORY_TOLERANCE_M:
+                mismatch.append(key)
         if mismatch:
-            print(f"Erro: as trajetórias diferem para velocidade/run: {mismatch}", file=sys.stderr)
+            print(f"Erro: as trajetórias diferem para velocidade/run: {sorted(set(mismatch))}", file=sys.stderr)
             failed = True
-        metadata.update({"completed_runs": len(manifests), "trajectory_hashes_match": not mismatch})
+        print(f"Trajetórias pareadas: desvio máximo de {max_deviation:.2e} m (tolerância {TRAJECTORY_TOLERANCE_M:g} m).")
+        metadata.update({"completed_runs": len(manifests), "trajectories_match": not mismatch,
+                         "trajectory_max_deviation_m": max_deviation,
+                         "trajectory_tolerance_m": TRAJECTORY_TOLERANCE_M})
     else:
         animation_manifests = list((root / "runs").glob("*.manifest.json"))
         matches = len(animation_manifests) == len(runs)
         for path in animation_manifests:
             baseline_path = baseline_root / "runs" / path.name
-            if not baseline_path.exists() or json.loads(path.read_text(encoding="utf-8")).get("trajectory_sha256") != json.loads(baseline_path.read_text(encoding="utf-8")).get("trajectory_sha256"):
+            if not baseline_path.exists():
                 matches = False
+                continue
+            current = json.loads(path.read_text(encoding="utf-8"))["files"]["mobility"]
+            baseline = json.loads(baseline_path.read_text(encoding="utf-8"))["files"]["mobility"]
+            matches = matches and same_trajectory(root / current, baseline_root / baseline)
         metadata["completed_runs"] = len(animation_manifests)
         metadata["animation_hashes_match_baseline"] = matches
         failed |= not matches
@@ -549,26 +537,7 @@ def main() -> int:
         except (OSError, ValueError, KeyError) as error:
             print(f"Erro na reprodução Etapa 1/2: {error}", file=sys.stderr)
             failed = True
-    if mode == "official":
-        uncompressed_bytes = uncompressed_directory_size(root)
-        if compress_xml or uncompressed_bytes > size_limit_bytes:
-            compressed_count = compress_flowmonitor_outputs(root)
-            applied = compressed_count > 0 or any((root / "raw").glob("*.xml.gz"))
-            metadata["flowmonitor_gzip_applied"] = applied
-            metadata["flowmonitor_xmls_compressed"] = compressed_count
-            metadata["flowmonitor_xmls_compressed"] = compressed_count
-        metadata["storage_estimate"] = {"observed_uncompressed_bytes": uncompressed_bytes,
-                                         "stored_bytes_after_compression": directory_size(root),
-                                         "size_limit_bytes": size_limit_bytes,
-                                         "projected_uncompressed_official_bytes": uncompressed_bytes}
-    elif mode == "pilot":
-        estimate = pilot_size_projection(root, len(matrix(config, args.stage)))
-        metadata["storage_estimate"] = estimate
-        metadata["flowmonitor_gzip_recommended_by_pilot"] = estimate["projected_uncompressed_official_bytes"] > size_limit_bytes
-        print(f"Dados observados do piloto: {estimate['observed_bytes'] / (1024*1024):.2f} MiB; "
-              f"projeção oficial {args.stage}: {estimate['projected_uncompressed_official_bytes'] / (1024*1024):.2f} MiB.")
-        if metadata["flowmonitor_gzip_recommended_by_pilot"]:
-            print("Aviso: projeção supera 50 MiB; o lote oficial compactará XMLs FlowMonitor em gzip.", file=sys.stderr)
+    metadata["finished_at_utc"] = utc_now()
     (root / "manifest.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
     return 1 if failed else 0
 

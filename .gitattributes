@@ -1,0 +1,6 @@
+* text=auto eol=lf
+# Dados oficiais: nunca converter finais de linha, para preservar os hashes SHA-256.
+experiments/manet-routing/data/** -text
+# Arquivos do ns-3 com CRLF no original: manter como estão.
+*.eps -text
+*.fad -text
