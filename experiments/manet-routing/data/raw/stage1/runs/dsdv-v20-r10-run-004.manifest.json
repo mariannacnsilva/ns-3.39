@@ -1,0 +1,133 @@
+{
+  "kind": "metrics",
+  "stage": "stage1",
+  "protocol": "dsdv",
+  "speed": 20.0,
+  "rate": 10,
+  "run": 4,
+  "seed": 12345,
+  "configuration_sha256": "eb0ef9890f838dc1e07b335e09f4b8b7b18461d8b3daa081e0b234315cbb51d4",
+  "trajectory_sha256": "f36a0b8eb0365e6dbd04a522ba4eeaa3bee220a410b6d28eb213cb218140c13f",
+  "command": [
+    "/home/mari/ns-3.39/.venv/bin/python",
+    "/home/mari/ns-3.39/ns3",
+    "run",
+    "--no-build",
+    "scratch/manet-routing-compare",
+    "--",
+    "--stage=stage1",
+    "--protocol=dsdv",
+    "--seed-master=12345",
+    "--run=4",
+    "--speed=20.0",
+    "--rate=10",
+    "--nodes=20",
+    "--flow-count=4",
+    "--flow-pairs=0:1;2:3;4:5;6:7",
+    "--wifi-standard=802.11g",
+    "--area-width=500.0",
+    "--area-height=500.0",
+    "--pause=10.0",
+    "--minimum-speed=1.0",
+    "--duration=120.0",
+    "--traffic-start=10.0",
+    "--traffic-stop=110.0",
+    "--tx-power=16.0",
+    "--rx-sensitivity=-101.0",
+    "--preamble-min-rssi=-82.0",
+    "--rts-cts-threshold=65535",
+    "--reference-loss=40.05",
+    "--reference-distance=1.0",
+    "--path-loss-exponent=2.6",
+    "--packet-size=512",
+    "--initial-position-stream=10",
+    "--mobility-stream=1000",
+    "--mobility-trace-interval=1.0",
+    "--flows=/home/mari/ns-3.39/experiments/manet-routing/data/raw/stage1/runs/dsdv-v20-r10-run-004/flows.csv",
+    "--mobility-trace=/home/mari/ns-3.39/experiments/manet-routing/data/raw/stage1/mobility/dsdv-v20-r10-run-004.csv",
+    "--flow-monitor=/home/mari/ns-3.39/experiments/manet-routing/data/raw/stage1/raw/dsdv-v20-r10-run-004.xml",
+    "--animation=false"
+  ],
+  "elapsed_seconds": 15.942602513001475,
+  "finished_at_utc": "2026-11-05T01:18:51+00:00",
+  "build_profile": "release",
+  "ns3_version": "3.39",
+  "project_git": {
+    "revision": "588d738d369044ebe6bf37bc48429439603c46c4",
+    "working_tree_dirty": false,
+    "status_short": []
+  },
+  "profile": {
+    "nodes": 20,
+    "area_width_m": 500.0,
+    "area_height_m": 500.0,
+    "wifi_standard": "802.11g",
+    "tx_power_dbm": 16.0,
+    "rx_sensitivity_dbm": -101.0,
+    "preamble_minimum_rssi_dbm": -82.0,
+    "rts_cts_threshold_bytes": 65535,
+    "pause_s": 10.0,
+    "minimum_speed_mps": 1.0,
+    "maximum_speeds_mps": [
+      1.0,
+      5.0,
+      10.0,
+      20.0
+    ],
+    "flow_pairs": [
+      [
+        0,
+        1
+      ],
+      [
+        2,
+        3
+      ],
+      [
+        4,
+        5
+      ],
+      [
+        6,
+        7
+      ]
+    ],
+    "packet_size_bytes": 512,
+    "rate_pps": [
+      10
+    ],
+    "repetitions": 10,
+    "duration_s": 120.0,
+    "traffic_start_s": 10.0,
+    "traffic_stop_s": 110.0,
+    "useful_duration_s": 100.0,
+    "initial_position_stream": 10,
+    "mobility_stream": 1000,
+    "mobility_trace_interval_s": 1.0,
+    "log_distance_exponent": 2.6,
+    "reference_distance_m": 1.0,
+    "reference_loss_db": 40.05,
+    "animation": {
+      "runs": [
+        1
+      ],
+      "rate_pps": 10,
+      "maximum_speeds_mps": [
+        1.0,
+        5.0,
+        10.0,
+        20.0
+      ],
+      "maximum_packets_per_trace_file": 100000,
+      "mobility_update_interval_s": 1.0,
+      "route_update_interval_s": 5.0,
+      "start_s": 0.0,
+      "stop_s": 120.0
+    }
+  },
+  "files": {
+    "flows": "runs/dsdv-v20-r10-run-004/flows.csv",
+    "mobility": "mobility/dsdv-v20-r10-run-004.csv.gz",
+    "flowmonitor": "raw/dsdv-v20-r10-run-004.xml.gz"
+  }
+}

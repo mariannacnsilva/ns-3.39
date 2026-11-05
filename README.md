@@ -4,9 +4,9 @@
 
 O objetivo é comparar AODV, DSDV e OLSR quanto à rapidez e à eficiência de entrega em uma MANET móvel, considerando confiabilidade e tráfego de controle. O estudo busca comprovar a hipótese (**H1**) de que aumentar a velocidade altera negativamente o atraso e/ou a taxa de entrega, sem declarar um protocolo vencedor. As conclusões são limitadas ao cenário e aos parâmetros descritos aqui.
 
-## Guia rápido: o que o experimento faz
+## O que o experimento faz
 
-Uma MANET é uma rede sem ponto de acesso central: os nós móveis enviam dados e podem encaminhar pacotes uns dos outros. O ns-3 simula os nós, o rádio, o movimento e o roteamento. O experimento envia quatro fluxos UDP entre pares fixos e mede os pacotes observados no destino.
+MANET é uma rede sem ponto de acesso central: os nós móveis enviam dados e podem encaminhar pacotes uns dos outros. O ns-3 simula os nós, o rádio, o movimento e o roteamento. O experimento envia quatro fluxos UDP entre pares fixos e mede os pacotes observados no destino.
 
 - **AODV** descobre rotas sob demanda; **DSDV** e **OLSR** mantêm informações de rota proativamente.
 - **PDR** é a porcentagem de pacotes transmitidos que chegaram ao destino.
@@ -32,10 +32,6 @@ Os parâmetros do cenário ficam em `config/experiment.json`; os fixos de rádio
 | Execuções | 3 protocolos × 4 velocidades × 10 runs = **120** | 3 protocolos × 4 velocidades × 2 cargas × 30 runs = **720** |
 
 A Etapa 2 altera apenas a carga oferecida. Em ambas, a posição inicial usa stream 10, a mobilidade usa streams atribuídos a partir de 1000, a seed mestre é 12345 e o run é passado a `RngSeedManager::SetRun`. Para uma mesma velocidade/run, os protocolos e cargas devem ter trajetórias iguais, conferidas pela comparação numérica dos traces com tolerância de 1 mm. O ns-3 integra a posição a cada consulta, e o tráfego muda quantas consultas ocorrem, então um resíduo de cerca de 10⁻⁶ m pode alterar o texto do trace mesmo com a mesma trajetória. O SHA-256 fica como verificação de integridade de cada arquivo. As runs 1–10 da Etapa 2 a 10 pacotes/s também são comparadas com a Etapa 1 para confirmar reprodução exata dos dados por fluxo.
-
-### Calibração do canal
-
-O alcance efetivo é limitado pelo `ThresholdPreambleDetectionModel` do ns-3 (−82 dBm), e não pela `RxSensitivity` (−101 dBm). Com expoente 3, o alcance seria de cerca de 85 m, e a rede de 20 nós em 500 × 500 m ficaria particionada. O expoente 2,6 foi escolhido pela geometria dos traces, sem usar o desempenho dos protocolos, com o critério de ao menos 90% dos pares origem-destino com caminho e cerca de 2 saltos. `scripts/range_check.py` confirma o alcance no simulador, com dois nós parados. O analisador calcula a conectividade real a partir dos traces (`connectivity.csv`).
 
 ### Métricas
 
@@ -70,7 +66,7 @@ O build e as simulações devem ser executados em Ubuntu 22.04/24.04, nativo ou 
 
 ### Hardware e software do ambiente inventariado
 
-Inventário da máquina disponível para este projeto em 4 de novembro de 2026. O build foi concluído no perfil `release`, que evita o `-march=native` do perfil `optimized`. **Os pilotos ainda não foram executados**, portanto estes dados descrevem o ambiente configurado, não uma execução experimental validada. Atualize esta seção caso os experimentos sejam executados em outra máquina ou com versões diferentes.
+Inventário da máquina disponível para este projeto em 4 de novembro de 2026. Os lotes oficiais foram executados neste ambiente, na revisão `588d738`, com o build no perfil `release`, que evita o `-march=native` do perfil `optimized`. Atualize esta seção caso os experimentos sejam executados em outra máquina ou com versões diferentes.
 
 | Componente | Especificação |
 |---|---|
@@ -128,7 +124,7 @@ python scripts/analyze.py --stage stage1 --input results/pilot-stage1-3
 
 Para a reprodução cruzada de piloto da Etapa 2, deve existir o piloto da Etapa 1 com o mesmo número de runs. O analisador exige pelo menos dois runs por célula; o piloto de um run serve apenas para validar execução, fluxos, traces e manifestos.
 
-### Lotes oficiais — executar somente após autorização
+### Lotes oficiais
 
 O mínimo oficial é cinco runs por célula; a configuração padrão usa os intervalos 1–10 e 1–30. O lote da Etapa 2 requer uma Etapa 1 oficial completa para conferir a reprodução das runs 1–10 a 10 pacotes/s.
 
@@ -139,7 +135,7 @@ python scripts/run_experiment.py --stage stage2 --jobs 3
 python scripts/analyze.py --stage stage2
 ```
 
-`--jobs N` controla o paralelismo. O lote oficial só inicia com o código commitado e recusa retomar uma saída iniciada em outra revisão. A execução é retomável quando a saída e a configuração correspondem; saídas incompatíveis são recusadas para evitar sobrescrita acidental. Não execute lotes oficiais até estimar duração e obter autorização.
+`--jobs N` controla o paralelismo. O lote oficial só inicia com o código commitado e recusa retomar uma saída iniciada em outra revisão. A execução é retomável quando a saída e a configuração correspondem; saídas incompatíveis são recusadas para evitar sobrescrita acidental. Estime a duração pelo piloto antes de iniciar: neste ambiente, com `--jobs 3`, a Etapa 1 levou cerca de 8 minutos e a Etapa 2, cerca de 42 minutos.
 
 ### Animações
 
@@ -154,6 +150,6 @@ O conjunto tem 12 XMLs: uma run, quatro velocidades e três protocolos. O simula
 - Dados brutos oficiais: `experiments/manet-routing/data/raw/stage1/` e `stage2/` — manifestos, CSVs por fluxo, traces de mobilidade e XMLs FlowMonitor comprimidos e log de progresso (`progress.log`).
 - Dados processados: `experiments/manet-routing/data/processed/<etapa>/` — `results.csv`, `summary.csv`, `h1-results.csv`, `h1-summary.md`, `connectivity.csv` e, na Etapa 2, `load-trend.csv` e `load-effect.md`.
 - Figuras: `experiments/manet-routing/figures/<etapa>/` — seis PNGs por etapa (quatro métricas e tráfego de controle), com unidades e ICs, e o painel 2 × 2 para o artigo (`panel.pdf` e `panel.png`).
-- Pilotos e animações: `results/`, fora do Git. Nessa pasta, só a calibração de 3 nov (`calibracao-2026-11-03/`) e o teste de alcance (`range-check/`) são versionados.
+- Pilotos e animações: `results/`, fora do Git. `python scripts/range_check.py` regenera a tabela do teste de alcance em `results/range-check/`.
 
 Antes de publicar os dados, confira o tamanho e os manifestos. Eles registram versão do ns-3, revisão, perfil de build, data e hora, seed, run, comando, configuração e hash da trajetória, calculado sobre o conteúdo descomprimido.

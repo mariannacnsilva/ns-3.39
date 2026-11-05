@@ -1,0 +1,13 @@
+protocol,metric,lowRate,highRate,outcomeLowRate,outcomeHighRate,sameOutcome,delta20vs1LowRate,delta20vs1HighRate
+aodv,delayMs,10,100,inconclusiva,inconclusiva,True,12.463493163953036,-9.021681257804662
+aodv,jitterMs,10,100,sustentada,inconclusiva,False,3.5056902761622943,0.00035056856470960795
+aodv,pdrPct,10,100,sustentada,inconclusiva,False,-15.69416666666666,-10.353583333333304
+aodv,throughputMbps,10,100,sustentada,inconclusiva,False,-0.027119519999999953,-0.17890991999999994
+dsdv,delayMs,10,100,inconclusiva,melhora,False,3.5315189021299718,-50.63025728802134
+dsdv,jitterMs,10,100,inconclusiva,inconclusiva,True,1.747709942243913,-0.5155627789355908
+dsdv,pdrPct,10,100,sustentada,sustentada,True,-30.594166666666688,-24.521000000000022
+dsdv,throughputMbps,10,100,sustentada,sustentada,True,-0.052866719999999964,-0.42372288000000013
+olsr,delayMs,10,100,inconclusiva,inconclusiva,True,0.6149973426400412,-30.28356639992831
+olsr,jitterMs,10,100,sustentada,inconclusiva,False,0.7645670768961936,-0.09282182477206469
+olsr,pdrPct,10,100,sustentada,sustentada,True,-30.398333333333326,-22.643416666666653
+olsr,throughputMbps,10,100,sustentada,sustentada,True,-0.052528319999999976,-0.3912782400000001
